@@ -42,7 +42,7 @@ Beklenen dizin: `src-tauri/target/release/bundle/nsis/`.
 - Workflow'un NSIS installer, installer `.sig` ve `latest.json` yüklediğini doğrulayın.
 - Release notes içinde lisans/AppData migration etkisini açıkça belirtin.
 
-Updater yalnız GitHub Releases içindeki kararlı `latest.json` dosyasını HTTPS üzerinden okur. Beta/nightly kanalı yoktur.
+Updater yalnız `https://github.com/elorstam/arz-predictor/releases/latest/download/latest.json` adresindeki kararlı GitHub Release metadata'sını HTTPS üzerinden okur. Beta/nightly kanalı yoktur.
 
 ## 5. Kurulum ve yükseltme kabulü
 

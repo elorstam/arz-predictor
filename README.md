@@ -52,6 +52,6 @@ GitHub Actions secrets:
 - `TAURI_SIGNING_PRIVATE_KEY`
 - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`
 
-`v*` etiketi `.github/workflows/release.yml` workflow'unu başlatır. Workflow gerçek repository adından HTTPS `latest.json` endpoint'ini build'e ekler, NSIS installer/signature üretir ve kararlı GitHub Release'a yükler. Uygulama yalnız daha yeni sürümü sunar; geçersiz veya imzasız paket native Tauri updater tarafından reddedilir.
+Kararlı updater endpoint'i `https://github.com/elorstam/arz-predictor/releases/latest/download/latest.json` adresidir. `v*` etiketi `.github/workflows/release.yml` workflow'unu başlatır; workflow aynı endpoint'i repository bilgisinden build'e uygular, NSIS installer/signature üretir ve kararlı GitHub Release'a yükler. Uygulama yalnız daha yeni sürümü sunar; geçersiz veya imzasız paket native Tauri updater tarafından reddedilir.
 
 Yayın ve geri alma adımları için `RELEASE_CHECKLIST.md` dosyasını kullanın.
