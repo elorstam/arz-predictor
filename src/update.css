@@ -1,0 +1,54 @@
+.update-summary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  padding: 16px 18px;
+}
+
+.update-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px;
+  border-radius: 8px;
+  background: var(--panel2);
+}
+
+.update-summary span { color: var(--muted); font-size: 10px; }
+.update-summary strong { font-size: 12px; }
+.update-state { color: var(--muted); }
+.update-current, .update-ready { color: var(--good); }
+.update-available { color: var(--accent); }
+.update-failed { color: var(--bad); }
+
+.update-progress {
+  height: 6px;
+  margin: 0 18px 12px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: var(--border);
+}
+
+.update-progress i {
+  display: block;
+  height: 100%;
+  border-radius: 6px;
+  background: var(--accent);
+  transition: width .2s ease;
+}
+
+.update-message {
+  min-height: 34px;
+  margin: 0;
+  padding: 0 18px 12px;
+  color: var(--muted);
+  font-size: var(--font-xs);
+  line-height: 1.45;
+}
+
+.update-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 18px 16px;
+}

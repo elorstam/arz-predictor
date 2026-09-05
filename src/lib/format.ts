@@ -1,0 +1,11 @@
+export const businessDate=()=>new Intl.DateTimeFormat("en-CA",{timeZone:"Europe/Istanbul",year:"numeric",month:"2-digit",day:"2-digit"}).format(new Date());
+export const percent=(v:number|null|undefined,digits=0)=>v==null?"—":new Intl.NumberFormat("tr-TR",{style:"percent",maximumFractionDigits:digits}).format(v);
+export const decimal=(v:number|null|undefined,digits=2)=>v==null?"—":new Intl.NumberFormat("tr-TR",{minimumFractionDigits:digits,maximumFractionDigits:digits}).format(v);
+export const money=(cents:number|null|undefined)=>cents==null?"—":new Intl.NumberFormat("tr-TR",{style:"currency",currency:"TRY"}).format(cents/100);
+export const localDate=(v:string|null|undefined,withDate=false)=>!v?"—":new Intl.DateTimeFormat("tr-TR",withDate?{dateStyle:"medium",timeStyle:"short"}:{hour:"2-digit",minute:"2-digit"}).format(new Date(v));
+export const marketLabel=(market:string,selection?:string,line?:number|null)=>({MATCH_RESULT:"Maç sonucu",BTTS:"KG Var",TOTAL_GOALS:`${line??""} ${selection==="OVER"?"Üst":selection==="UNDER"?"Alt":selection??""}`.trim(),FULL_TIME_TOTAL_CORNERS:"Toplam korner",FULL_TIME_TOTAL_CARDS:"Toplam kart"}[market]??`${market} ${selection??""}`);
+export const categoryLabel=(value:string)=>({CORNERS:"Korner",OVER_25:"2.5 Üst",OVER_35:"3.5 Üst",BTTS_YES:"KG Var",HIGH_CONFIDENCE:"Yüksek Güven",SURPRISE:"Sürpriz",COMPOUND:"Katlama",DAILY_CORNERS:"Korner",DAILY_OVER_25:"2.5 Üst",DAILY_OVER_35:"3.5 Üst",DAILY_BTTS:"KG Var",DAILY_HIGH_CONFIDENCE:"Yüksek Güven",DAILY_SURPRISE_SYSTEM:"Sürpriz Sistem",DAILY_COMPOUND:"Katlama"}[value]??value);
+export const performanceMarketLabel=(value:string|null|undefined)=>value?({MATCH_RESULT:"Maç sonucu",BTTS:"KG Var",TOTAL_GOALS:"Toplam gol",TEAM_TOTAL_GOALS:"Takım toplam gol",FULL_TIME_TOTAL_CORNERS:"Toplam korner",FULL_TIME_TOTAL_CARDS:"Toplam kart"}[value]??value):"Tümü";
+export const contextLabel=(value:string)=>({BASE:"BASE",LINEUP_AWARE:"11'ler sonrası",BASE_RETAINED:"BASE korundu"}[value]??value);
+export const windowLabel=(value:string)=>({LAST_7_DAYS:"Son 7 gün",LAST_30_DAYS:"Son 30 gün",SEASON:"Sezon",ALL_TIME:"Tüm zamanlar"}[value]??value);
+export const friendlyError=(error:string)=>error.includes("TAURI")||error.includes("BACKEND")?"Masaüstü veri servisine ulaşılamadı.":error.includes("NO_")?"Bu görünüm için henüz yeterli veri yok.":"Veriler alınırken bir sorun oluştu.";

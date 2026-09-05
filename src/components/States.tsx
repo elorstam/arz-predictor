@@ -1,0 +1,5 @@
+import { friendlyError } from "../lib/format";
+export function LoadingState({rows=4}:{rows?:number}){return <div className="skeleton-list" aria-label="Yükleniyor">{Array.from({length:rows},(_,i)=><div className="skeleton" key={i}/>)}</div>}
+export function EmptyState({title="Gösterilecek veri yok",detail}:{title?:string;detail?:string}){return <div className="state"><span className="state-icon">○</span><strong>{title}</strong>{detail&&<p>{detail}</p>}</div>}
+export function ErrorState({error,onRetry}:{error:string;onRetry:()=>void}){return <div className="state error-state"><span className="state-icon">!</span><strong>{friendlyError(error)}</strong><button className="button secondary" onClick={onRetry}>Yeniden dene</button><details><summary>Teknik ayrıntı</summary><code>{error}</code></details></div>}
+export function DataState<T>({loading,error,data,onRetry,empty,children}:{loading:boolean;error:string|null;data:T|null;onRetry:()=>void;empty?:boolean;children:(data:T)=>React.ReactNode}){if(loading)return <LoadingState/>;if(error)return <ErrorState error={error} onRetry={onRetry}/>;if(!data||empty)return <EmptyState/>;return <>{children(data)}</>}

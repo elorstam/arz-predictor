@@ -1,0 +1,2 @@
+import { useState } from "react";
+export function TeamLogo({name,src}:{name:string;src?:string|null}){const [broken,setBroken]=useState(false);const initials=name.split(/\s+/).slice(0,2).map(x=>x[0]).join("").toLocaleUpperCase("tr-TR");return src&&!broken?<img className="team-logo" src={src} alt="" onError={()=>setBroken(true)}/>:<span className="team-logo fallback" aria-hidden="true">{initials}</span>}

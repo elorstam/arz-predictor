@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ARZ Predictor",
+  "mainBinaryName": "ARZ Predictor",
+  "version": "../package.json",
+  "identifier": "com.footballpredictor.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ARZ Predictor",
+        "width": 1360,
+        "height": 820,
+        "minWidth": 1180,
+        "minHeight": 680
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' customprotocol: asset:; connect-src ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; font-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "publisher": "ARZ",
+    "shortDescription": "Yerel ve gizli futbol tahmin analitiği",
+    "longDescription": "ARZ Predictor yerel veri ve model analitiğini lisanslı bir Windows masaüstü uygulamasında sunar.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Turkish", "English"],
+        "displayLanguageSelector": false,
+        "startMenuFolder": "ARZ"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRBODlGMDA2M0E5MTY1RkYKUldUL1paRTZCdkNKU3ZjOFNHWXVGNlkxTDlDMDhFWUNsVWtRSFZxb0prSDljZ29rTVV5cDZ4SUcK",
+      "endpoints": [],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}
