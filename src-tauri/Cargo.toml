@@ -1,6 +1,6 @@
 [package]
 name = "football-predictor"
-version = "1.0.1"
+version = "1.0.2"
 description = "ARZ Predictor desktop application"
 authors = ["ARZ"]
 edition = "2021"
