@@ -313,7 +313,7 @@ fn transport_error_categories_are_specific() {
 #[test]
 fn catalog_contains_only_verified_recent_datasets() {
     let datasets = supported_datasets();
-    assert_eq!(datasets.len(), 59);
+    assert_eq!(datasets.len(), 95);
     assert!(find_dataset("E0", "2627").is_some());
     assert!(find_dataset("E1", "2122").is_some());
     assert!(find_dataset("T1", "2627").is_some());
@@ -702,6 +702,24 @@ fn managed_cache_paths_are_deterministic_and_catalog_bounded() {
 }
 
 #[test]
+fn cached_metadata_revalidates_changed_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = super::cache::dataset_path(directory.path(), dataset()).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, COMPLETE_CSV).unwrap();
+    let first = super::cache::metadata(directory.path(), dataset()).unwrap();
+    let repeat = super::cache::metadata(directory.path(), dataset()).unwrap();
+    assert!(first.parseable && repeat.parseable);
+    assert_eq!(first.sha256, repeat.sha256);
+    std::fs::write(&path, "not,a,football,csv\n1,2,3,4\n").unwrap();
+    assert!(
+        !super::cache::metadata(directory.path(), dataset())
+            .unwrap()
+            .parseable
+    );
+}
+
+#[test]
 fn manual_file_is_validated_and_atomically_cached() {
     let directory = tempfile::tempdir().expect("temporary directory should exist");
     let database = file_database(&directory);
@@ -746,8 +764,8 @@ fn cached_bootstrap_presets_resolve_without_fabricating_bundesliga() {
         .expect("six-season preset should resolve");
     let recent = super::cached_bootstrap::preset_datasets(super::CORE_RECENT_3_SEASONS)
         .expect("recent preset should resolve");
-    assert_eq!(six.len(), 59);
-    assert_eq!(recent.len(), 29);
+    assert_eq!(six.len(), 95);
+    assert_eq!(recent.len(), 65);
     assert!(!six
         .iter()
         .any(|item| item.league_code == "D1" && item.season_code == "2627"));
@@ -780,12 +798,12 @@ fn cache_only_and_cache_first_are_offline_and_idempotent() {
     };
     let first = tauri::async_runtime::block_on(super::bootstrap_cached(&database, &cache_only))
         .expect("bootstrap should finish");
-    assert_eq!(first.datasets_requested, 29);
+    assert_eq!(first.datasets_requested, 65);
     assert_eq!(
         (first.datasets_available, first.datasets_imported),
-        (29, 29)
+        (65, 65)
     );
-    assert_eq!(first.matches_inserted, 29);
+    assert_eq!(first.matches_inserted, 65);
 
     let cache_first = super::CachedBootstrapRequest {
         acquisition_mode: "cache_first".to_string(),
@@ -801,7 +819,7 @@ fn cache_only_and_cache_first_are_offline_and_idempotent() {
     assert_eq!(e0.acquisition_source.as_deref(), Some("cache"));
     assert!(!e0.downloaded);
     assert_eq!(e0.matches_inserted, 0);
-    assert_eq!(second.datasets_imported, 29);
+    assert_eq!(second.datasets_imported, 65);
 }
 
 #[test]
@@ -818,7 +836,7 @@ fn cache_stats_and_bootstrap_status_are_filesystem_and_database_derived() {
     assert_eq!(stats.total_bytes, cached.size_bytes.unwrap());
     let status = super::status(&database, super::CORE_RECENT_3_SEASONS)
         .expect("bootstrap status should load");
-    assert_eq!(status.preset_dataset_count, 29);
+    assert_eq!(status.preset_dataset_count, 65);
     assert_eq!(status.datasets_cached, 1);
     assert_eq!(status.datasets_imported_successfully, 1);
     assert_eq!(

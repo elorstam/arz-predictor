@@ -62,6 +62,8 @@ pub struct LatestOdd {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpcomingMatch {
+    pub status: String,
+    pub model_coverage: super::model_coverage::CoverageState,
     pub match_id: i64,
     pub provider_event_id: String,
     pub competition_id: i64,
@@ -118,49 +120,49 @@ pub fn resolve_competition(
     connection: &Connection,
     input: &CompetitionInput<'_>,
 ) -> rusqlite::Result<Option<Resolution>> {
-    if let Some(id) = connection
+    let mapped_id: Option<i64> = connection
         .query_row(
             "SELECT competition_id FROM provider_competition_mappings
-             WHERE provider = ?1 AND external_competition_id = ?2",
+             WHERE provider=?1 AND external_competition_id=?2",
             params![PROVIDER_ID, input.external_id],
             |row| row.get(0),
         )
-        .optional()?
-    {
+        .optional()?;
+    if let Some(id) = mapped_id {
         record_competition_metadata(connection, input, true)?;
         return Ok(Some(Resolution { id, created: false }));
     }
     let Some(name) = input.name.map(str::trim).filter(|name| !name.is_empty()) else {
+        if let Some(id) = mapped_id {
+            record_competition_metadata(connection, input, true)?;
+            return Ok(Some(Resolution { id, created: false }));
+        }
         record_competition_metadata(connection, input, false)?;
         return Ok(None);
     };
-    let existing = connection
+    let canonical = {
+        let mut stmt = connection.prepare("SELECT DISTINCT c.id,c.name,c.country FROM competitions c JOIN provider_competition_mappings pcm ON pcm.competition_id=c.id AND pcm.provider='football-data.co.uk'")?;
+        let rows: Vec<(i64, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows.into_iter()
+            .find(|(_, n, c)| {
+                crate::repositories::resolution::competition_alias_compatible(
+                    name,
+                    n,
+                    input.country,
+                    c.as_deref(),
+                )
+            })
+            .map(|(id, _, _)| id)
+    };
+    let existing = canonical.or(mapped_id).or(connection
         .query_row(
-            "SELECT id FROM competitions WHERE name = ?1 AND country IS ?2",
+            "SELECT id FROM competitions WHERE name=?1 AND country IS ?2",
             params![name, input.country],
             |row| row.get(0),
         )
-        .optional()?
-        .or_else(|| {
-            let mut stmt = connection
-                .prepare("SELECT id,name,country FROM competitions WHERE country IS ?1")
-                .ok()?;
-            let rows: Vec<(i64, String, Option<String>)> = stmt
-                .query_map([input.country], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .ok()?
-                .filter_map(Result::ok)
-                .collect();
-            rows.into_iter()
-                .find(|(_, n, c)| {
-                    crate::repositories::resolution::competition_alias_compatible(
-                        name,
-                        n,
-                        input.country,
-                        c.as_deref(),
-                    )
-                })
-                .map(|(id, _, _)| id)
-        });
+        .optional()?);
     let (id, created) = match existing {
         Some(id) => (id, false),
         None => {
@@ -174,7 +176,9 @@ pub fn resolve_competition(
     connection.execute(
         "INSERT INTO provider_competition_mappings (
             provider, external_competition_id, competition_id
-         ) VALUES (?1, ?2, ?3)",
+         ) VALUES (?1, ?2, ?3)
+         ON CONFLICT(provider,external_competition_id) DO UPDATE SET
+            competition_id=excluded.competition_id",
         params![PROVIDER_ID, input.external_id, id],
     )?;
     record_competition_metadata(connection, input, true)?;
@@ -239,7 +243,8 @@ pub fn upsert_match(
         connection.execute(
             "UPDATE matches SET competition_id = ?2, season = ?3, home_team_id = ?4,
                 away_team_id = ?5, kickoff_at = ?6, scheduled_local_date = ?7,
-                kickoff_time_known = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                kickoff_time_known = 1, status = 'scheduled',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
                 match_id,
@@ -296,13 +301,45 @@ pub fn upsert_match(
     Ok((match_id, inserted))
 }
 
+pub fn mark_events_missing_from_refresh_inactive(
+    connection: &Connection,
+    refresh_started_at: &str,
+) -> rusqlite::Result<usize> {
+    connection.execute(
+        "UPDATE matches SET status='cancelled',
+                updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+         WHERE status='scheduled' AND updated_at<?2
+           AND id IN (
+               SELECT match_id FROM provider_match_mappings
+               WHERE provider=?1
+           )",
+        params![PROVIDER_ID, refresh_started_at],
+    )
+}
+
 pub fn insert_odds_if_changed(
     connection: &Connection,
     input: &OddsInput<'_>,
 ) -> rusqlite::Result<bool> {
+    let stored:Option<(String,String)>=connection.query_row("SELECT market,outcome FROM provider_selection_mappings WHERE provider='iddaa' AND match_id=?1 AND market_id=?2 AND selection_id=?3 AND line_key=?4",params![input.match_id,input.provider_market_id,input.provider_selection_code,input.provider_line.unwrap_or("")],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+    let normalized_market = stored
+        .as_ref()
+        .map(|x| x.0.as_str())
+        .unwrap_or(input.normalized_market_type);
+    let normalized_selection = stored
+        .as_ref()
+        .map(|x| x.1.as_str())
+        .or(input.normalized_selection);
+    if let (Some(market_id), Some(selection_id), Some(_)) = (
+        input.provider_market_id,
+        input.provider_selection_code,
+        input.normalized_selection,
+    ) {
+        connection.execute("INSERT INTO provider_selection_mappings(provider,match_id,market_id,selection_id,line_key,market,outcome) VALUES('iddaa',?1,?2,?3,?4,?5,?6) ON CONFLICT DO NOTHING",params![input.match_id,market_id,selection_id,input.provider_line.unwrap_or(""),input.normalized_market_type,input.normalized_selection])?;
+    }
     let latest = connection
         .query_row(
-            "SELECT odd, alternative_odd FROM odds_snapshots
+            "SELECT odd, alternative_odd, captured_at FROM odds_snapshots
              WHERE provider = ?1 AND match_id = ?2 AND market_code = ?3
                AND provider_market_id IS ?4 AND provider_line IS ?5
                AND provider_selection_code IS ?6 AND selection = ?7
@@ -316,10 +353,25 @@ pub fn insert_odds_if_changed(
                 input.provider_selection_code,
                 input.selection
             ],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Option<f64>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, f64>(0)?,
+                    row.get::<_, Option<f64>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?;
-    if latest == Some((input.odd, input.alternative_odd)) {
+    // Retain immutable observations: unchanged prices still need a fresh snapshot
+    // after an hour, otherwise a successfully refreshed bulletin looks stale.
+    if latest.as_ref().is_some_and(|(odd, alternative, captured)| {
+        *odd == input.odd
+            && *alternative == input.alternative_odd
+            && chrono::DateTime::parse_from_rfc3339(captured)
+                .ok()
+                .zip(chrono::DateTime::parse_from_rfc3339(input.captured_at).ok())
+                .is_some_and(|(old, new)| (new - old).num_seconds() < 3600)
+    }) {
         return Ok(false);
     }
     connection.execute(
@@ -333,7 +385,7 @@ pub fn insert_odds_if_changed(
             input.match_id,
             PROVIDER_ID,
             input.market_code,
-            input.normalized_market_type,
+            normalized_market,
             input.line_value,
             input.selection,
             input.odd,
@@ -342,7 +394,7 @@ pub fn insert_odds_if_changed(
             input.provider_market_id,
             input.provider_selection_code,
             input.provider_line,
-            input.normalized_selection
+            normalized_selection
         ],
     )?;
     Ok(true)
@@ -410,23 +462,32 @@ pub fn latest_odds(connection: &Connection, match_id: i64) -> rusqlite::Result<V
 }
 
 pub fn upcoming_matches(connection: &Connection) -> rusqlite::Result<Vec<UpcomingMatch>> {
+    matches_for_date(connection, None)
+}
+
+pub fn matches_for_date(
+    connection: &Connection,
+    date: Option<&str>,
+) -> rusqlite::Result<Vec<UpcomingMatch>> {
     let mut statement = connection.prepare(
         "SELECT m.id, pm.external_match_id, c.id, c.name, m.kickoff_at,
                 h.id, h.normalized_name, a.id, a.normalized_name,
-                COUNT(DISTINCT o.market_code || ':' || COALESCE(o.provider_market_id, '') || ':' || COALESCE(o.provider_line, ''))
+                COUNT(DISTINCT o.market_code || ':' || COALESCE(o.provider_market_id, '') || ':' || COALESCE(o.provider_line, '')),m.status
          FROM matches m
          JOIN provider_match_mappings pm ON pm.match_id = m.id AND pm.provider = ?1
          JOIN competitions c ON c.id = m.competition_id
          JOIN teams h ON h.id = m.home_team_id
          JOIN teams a ON a.id = m.away_team_id
          LEFT JOIN odds_snapshots o ON o.match_id = m.id AND o.provider = ?1
-         WHERE m.status = 'scheduled'
+         WHERE (?2 IS NOT NULL OR m.status = 'scheduled') AND (?2 IS NULL OR m.scheduled_local_date=?2)
          GROUP BY m.id, pm.external_match_id, c.id, c.name, m.kickoff_at, h.id, h.normalized_name, a.id, a.normalized_name
          ORDER BY m.kickoff_at, m.id",
     )?;
     let rows = statement
-        .query_map([PROVIDER_ID], |row| {
+        .query_map(params![PROVIDER_ID, date], |row| {
             Ok(UpcomingMatch {
+                status: row.get(10)?,
+                model_coverage: super::model_coverage::classify(connection, row.get(0)?)?,
                 match_id: row.get(0)?,
                 provider_event_id: row.get(1)?,
                 competition_id: row.get(2)?,

@@ -6,6 +6,229 @@ fn fixture() -> Database {
     fixture_with_odd(2.60)
 }
 
+#[test]
+fn automatic_coupon_outcome_without_stake_never_invents_realized_money() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    let run = phase7_run(&c);
+    c.execute(
+        "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+        [run.run_id],
+    )
+    .unwrap();
+    let coupon = coupon_engine::generate_daily(
+        &c,
+        &coupon_engine::GenerateRequest {
+            business_date: run.business_date.clone(),
+            candidate_run_id: Some(run.run_id),
+            coupon_type: Some("DAILY_OVER_25".into()),
+            unit_stake_cents: None,
+        },
+    )
+    .unwrap()
+    .remove(0);
+    c.execute(
+        "UPDATE matches SET status='finished',final_home_goals=2,final_away_goals=1",
+        [],
+    )
+    .unwrap();
+    assert!(super::coupon_settlement::run(&c).unwrap() > 0);
+    let settled = coupon_engine::get_coupon(&c, coupon.id).unwrap();
+    assert_eq!(settled.status, "SETTLED");
+    assert!(settled.total_stake_cents.is_none());
+    assert_eq!(settled.metadata["financial_state"], "STAKE_NOT_RECORDED");
+    assert!(settled.metadata["settlement"].is_null());
+    assert_eq!(
+        c.query_row(
+            "SELECT settlement_result FROM phase8_coupons WHERE id=?1",
+            [coupon.id],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "WON"
+    );
+    assert_eq!(super::coupon_settlement::run(&c).unwrap(), 0);
+}
+
+#[test]
+fn automatic_corner_coupon_preserves_line_and_waits_for_actual_final_statistics() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) SELECT match_id,'fe_v1','2026-09-02T11:01:00Z','{}',json_set(data_quality_json,'$.corners_coverage',1.0),'2026-09-02T11:01:00Z' FROM feature_sets",[]).unwrap();
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,bucket_sample_size,availability,created_at) SELECT match_id,'FULL_TIME_TOTAL_CORNERS','OVER',8.5,0.6,'corner',kickoff_at,model_version_id,0.6,0.6,'CALIBRATED_V1',25,'AVAILABLE',created_at FROM predictions",[]).unwrap();
+    c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT id,'iddaa','corner','FULL_TIME_TOTAL_CORNERS','OVER',1.6,'FULL_TIME_TOTAL_CORNERS','OVER',8.5,'2026-09-02T10:00:00Z' FROM matches",[]).unwrap();
+    let run = phase7_run(&c);
+    c.execute(
+        "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+        [run.run_id],
+    )
+    .unwrap();
+    let coupon = coupon_engine::generate_daily(
+        &c,
+        &coupon_engine::GenerateRequest {
+            business_date: run.business_date.clone(),
+            candidate_run_id: Some(run.run_id),
+            coupon_type: Some("DAILY_CORNERS".into()),
+            unit_stake_cents: Some(1000),
+        },
+    )
+    .unwrap()
+    .remove(0);
+    c.execute(
+        "UPDATE matches SET status='finished',final_home_goals=2,final_away_goals=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(super::coupon_settlement::run(&c).unwrap(), 0);
+    let pending = coupon_engine::get_coupon(&c, coupon.id).unwrap();
+    assert_ne!(pending.status, "SETTLED");
+    assert!(pending.selections.iter().all(|s| s.line == Some(8.5)
+        && s.selection == "OVER"
+        && s.settlement_state == "PENDING_DATA"
+        && s.settlement_reason.as_deref() == Some("FINAL_CORNERS_UNAVAILABLE")));
+    c.execute("INSERT INTO match_statistics(match_id,home_corners,away_corners) SELECT id,5,4 FROM matches",[]).unwrap();
+    assert!(super::coupon_settlement::run(&c).unwrap() > 0);
+    assert_eq!(
+        coupon_engine::get_coupon(&c, coupon.id).unwrap().metadata["settlement"]["status"],
+        "WON"
+    );
+}
+
+#[test]
+fn automatic_final_scores_settle_published_coupons_and_drive_katlama() {
+    for (home, away, step, expected, next) in [
+        (2, 1, 1, "WON", 2),
+        (0, 0, 1, "LOST", 1),
+        (2, 1, 7, "WON", 1),
+    ] {
+        let db = fixture_with_odd(1.3);
+        let c = db.connection().unwrap();
+        let run = phase7_run(&c);
+        c.execute(
+            "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+            [run.run_id],
+        )
+        .unwrap();
+        let coupon = coupon_engine::generate_daily(
+            &c,
+            &coupon_engine::GenerateRequest {
+                business_date: run.business_date.clone(),
+                candidate_run_id: Some(run.run_id),
+                coupon_type: Some("DAILY_OVER_25".into()),
+                unit_stake_cents: Some(1000),
+            },
+        )
+        .unwrap()
+        .remove(0);
+        let series = coupon_engine::start_series(&c, &run.business_date, 1000).unwrap();
+        c.execute(
+            "UPDATE phase8_compound_series SET current_step=?2 WHERE id=?1",
+            params![series.id, step],
+        )
+        .unwrap();
+        let compound =
+            coupon_engine::generate_compound_step(&c, &run.business_date, Some(run.run_id))
+                .unwrap();
+        c.execute("UPDATE matches SET status='cancelled'", [])
+            .unwrap();
+        assert_eq!(super::coupon_settlement::run(&c).unwrap(), 0);
+        assert_eq!(
+            coupon_engine::series(&c, series.id).unwrap().current_step,
+            step as usize
+        );
+        assert!(
+            c.query_row(
+                "SELECT count(*) FROM coupon_selection_settlement_audit WHERE state='PENDING_DATA'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap()
+                > 0
+        );
+        c.execute(
+            "UPDATE matches SET status='finished',final_home_goals=?1,final_away_goals=?2",
+            params![home, away],
+        )
+        .unwrap();
+        assert!(super::coupon_settlement::run(&c).unwrap() > 0);
+        for id in [coupon.id, compound.id] {
+            assert_eq!(
+                c.query_row(
+                    "SELECT settlement_result FROM phase8_coupons WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            coupon_engine::series(&c, series.id).unwrap().current_step,
+            next
+        );
+        assert_eq!(super::coupon_settlement::run(&c).unwrap(), 0);
+        let saved = coupon_engine::get_coupon(&c, coupon.id).unwrap();
+        assert_eq!(saved.combined_decimal_odd, coupon.combined_decimal_odd);
+        assert_eq!(saved.selections[0].odd, coupon.selections[0].odd);
+    }
+}
+
+#[test]
+fn compound_search_finds_pairs_triples_and_rejects_correlation() {
+    let db = fixture_with_odd(1.3);
+    let c = db.connection().unwrap();
+    let run = phase7_run(&c);
+    let mut pool: Vec<_> = run
+        .candidates
+        .into_iter()
+        .filter(|x| x.category == "COMPOUND")
+        .take(3)
+        .collect();
+    assert_eq!(pool.len(), 3);
+    pool[0].iddaa_odd = 1.2;
+    pool[1].iddaa_odd = 1.5;
+    let pair = coupon_engine::search_compound(&pool[..2]);
+    assert_eq!(pair.pairs_evaluated, 1);
+    assert!((pair.chosen.unwrap().combined_odd - 1.8).abs() < 1e-9);
+    for p in &mut pool {
+        p.iddaa_odd = 1.21;
+    }
+    let triple = coupon_engine::search_compound(&pool);
+    assert_eq!(triple.pairs_evaluated, 3);
+    assert_eq!(triple.triples_evaluated, 1);
+    assert_eq!(triple.chosen.as_ref().unwrap().candidate_ids.len(), 3);
+    assert!((triple.chosen.unwrap().combined_odd - 1.771561).abs() < 1e-9);
+    pool[0].iddaa_odd = 1.2;
+    pool[1].iddaa_odd = 1.5;
+    pool[1].match_id = pool[0].match_id;
+    let rejected = coupon_engine::search_compound(&pool[..2]);
+    assert!(rejected.chosen.is_none());
+    assert_eq!(rejected.correlated_rejected, 1);
+    assert_eq!(rejected.reason, "ALL_COMBINATIONS_CORRELATED");
+    pool[1].match_id += 100;
+    pool[0].iddaa_odd = 1.1;
+    pool[1].iddaa_odd = 1.1;
+    let too_low = coupon_engine::search_compound(&pool[..2]);
+    assert!(too_low.chosen.is_none());
+    assert!((too_low.closest[3].1.as_ref().unwrap().combined_odd - 1.21).abs() < 1e-9);
+}
+
+#[test]
+fn compound_accepts_validated_raw_fallback_without_weakening_sample_gate() {
+    let db = fixture_with_odd(1.3);
+    let c = db.connection().unwrap();
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) SELECT match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,'CALIBRATION_NOT_BENEFICIAL',calibration_version,25,availability,'2026-09-02T11:01:00Z' FROM predictions",[]).unwrap();
+    assert!(phase7_run(&c)
+        .candidates
+        .iter()
+        .any(|x| x.category == "COMPOUND"));
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) SELECT match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,0,availability,'2026-09-02T11:02:00Z' FROM predictions WHERE created_at='2026-09-02T11:01:00Z'",[]).unwrap();
+    assert!(!phase7_run(&c)
+        .candidates
+        .iter()
+        .any(|x| x.category == "COMPOUND"));
+}
+
 fn fixture_with_odd(odd: f64) -> Database {
     let db = Database::open_in_memory().unwrap();
     let c = db.connection().unwrap();
@@ -23,8 +246,8 @@ fn fixture_with_odd(odd: f64) -> Database {
         .unwrap();
         c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(1,'2026/27',?1,?2,'2026-09-02T18:00:00Z','scheduled','2026-09-02',1)",params![i*2+1,i*2+2]).unwrap();
         let id = i + 1;
-        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,'fe_v1','2026-09-02T11:00:00Z','{}',?2)",params![id, r#"{"history_matches_home":10,"history_matches_away":10}"#]).unwrap();
-        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability) VALUES(?1,'TOTAL_GOALS','OVER',2.5,0.80,'p8','2026-09-02T18:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal8',25,'AVAILABLE')",[id]).unwrap();
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(?1,'fe_v1','2026-09-02T11:00:00Z','{}',?2,'2026-09-02T10:00:00Z')",params![id, r#"{"history_matches_home":10,"history_matches_away":10}"#]).unwrap();
+        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) VALUES(?1,'TOTAL_GOALS','OVER',2.5,0.80,'p8','2026-09-02T18:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal8',25,'AVAILABLE','2026-09-02T11:00:00Z')",[id]).unwrap();
         c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(?1,'iddaa','p8','TOTAL_GOALS','OVER',?2,'TOTAL_GOALS','OVER',2.5,'2026-09-02T10:00:00Z')",params![id, odd]).unwrap();
     }
     drop(c);
@@ -44,6 +267,185 @@ fn phase7_run(c: &rusqlite::Connection) -> candidate_engine::DailyRun {
     .unwrap()
 }
 
+#[test]
+fn daily_candidates_recovery_shares_coupon_pools_and_ignores_empty_lineup() {
+    use super::daily_selections;
+    let db = fixture_with_odd(1.3);
+    let c = db.connection().unwrap();
+    c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) SELECT match_id,'fe_v1','2026-09-02T11:01:00Z','{}',json_set(data_quality_json,'$.corners_coverage',1.0),'2026-09-02T11:01:00Z' FROM feature_sets",[]).unwrap();
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,bucket_sample_size,availability,created_at) SELECT match_id,'FULL_TIME_TOTAL_CORNERS','OVER',8.5,0.6,'corner',kickoff_at,model_version_id,0.6,0.6,'CALIBRATED_V1',25,'AVAILABLE',created_at FROM predictions",[]).unwrap();
+    c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT id,'iddaa','corner','FULL_TIME_TOTAL_CORNERS','OVER',1.6,'FULL_TIME_TOTAL_CORNERS','OVER',8.5,'2026-09-02T10:00:00Z' FROM matches",[]).unwrap();
+    let base = phase7_run(&c);
+    coupon_engine::generate_daily(
+        &c,
+        &coupon_engine::GenerateRequest {
+            business_date: base.business_date.clone(),
+            candidate_run_id: Some(base.run_id),
+            coupon_type: None,
+            unit_stake_cents: None,
+        },
+    )
+    .unwrap();
+    let revision = candidate_engine::generate_lineup_revision(
+        &c,
+        &candidate_engine::LineupRevisionGenerateRequest {
+            base_run_id: base.run_id,
+            business_date: base.business_date.clone(),
+        },
+    )
+    .unwrap();
+    assert!(!candidate_engine::valid_lineup_run(&c, revision.run_id).unwrap());
+    c.execute("INSERT INTO candidate_engine_runs(business_date,timezone,generated_at,model_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,input_fingerprint,status,match_count_considered,prediction_context,parent_candidate_run_id) SELECT business_date,timezone,'2026-09-02T13:00:00Z',model_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,'empty-newer-lineup','COMPLETED',0,'LINEUP_AWARE',id FROM candidate_engine_runs WHERE id=?1",[base.run_id]).unwrap();
+    let empty_id = c.last_insert_rowid();
+    // Reproduce a corrupt publication pointer to the newer empty comparison.
+    c.execute(
+        "UPDATE daily_output_publications SET candidate_run_id=?1 WHERE business_date=?2",
+        params![empty_id, base.business_date],
+    )
+    .unwrap();
+    let output = daily_selections::get(&c, &base.business_date).unwrap();
+    assert_eq!(output.run.run.run_id, base.run_id);
+    assert!(!output.run.lineup_verified);
+    assert_eq!(output.run.run.prediction_context.as_deref(), Some("BASE"));
+    for (kind, cat) in [
+        ("DAILY_CORNERS", "CORNERS"),
+        ("DAILY_HIGH_CONFIDENCE", "HIGH_CONFIDENCE"),
+        ("DAILY_OVER_25", "OVER_25"),
+    ] {
+        let coupon = output
+            .coupons
+            .iter()
+            .find(|x| x.coupon_type == kind)
+            .unwrap_or_else(|| panic!("missing {kind}, counts {:?}", output.run.category_counts));
+        assert_eq!(
+            coupon.source_candidate_run_id,
+            output.publication.category_run_ids[cat]
+        );
+        assert!(coupon.selections.iter().all(|s| output
+            .run
+            .run
+            .candidates
+            .iter()
+            .any(|x| x.id == s.candidate_id && x.category == cat)));
+    }
+    assert!(output.run.category_counts["ALL"] < output.run.run.candidates.len());
+    for x in &output.run.run.candidates {
+        if x.category == "OVER_25" {
+            assert_eq!(
+                output.run.selection_sources[&x.id].selection_status,
+                "DAILY_RANKED"
+            );
+            assert!(!output.run.selection_sources[&x.id].strict_qualified);
+        }
+    }
+}
+
+#[test]
+fn daily_goal_top_seven_keeps_all_valid_low_probability_candidates_in_pool() {
+    for (market, selection, line, category, kind) in [
+        ("TOTAL_GOALS", "OVER", Some(2.5), "OVER_25", "DAILY_OVER_25"),
+        ("BTTS", "YES", None, "BTTS_YES", "DAILY_BTTS"),
+    ] {
+        let db = fixture_with_odd(1.5);
+        let c = db.connection().unwrap();
+        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,bucket_sample_size,availability,created_at) SELECT match_id,?1,?2,?3,0.58,'daily',kickoff_at,model_version_id,0.58,0.58,'UNCALIBRATED_V1',0,'AVAILABLE','2026-09-02T11:30:00Z' FROM predictions",params![market,selection,line]).unwrap();
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT id,'iddaa','daily',?1,?2,1.5,?1,?2,?3,'2026-09-02T11:00:00Z' FROM matches",params![market,selection,line]).unwrap();
+        let run = phase7_run(&c);
+        let pool: Vec<_> = run
+            .candidates
+            .iter()
+            .filter(|x| x.category == category)
+            .collect();
+        assert_eq!(pool.len(), 14);
+        assert!(pool
+            .iter()
+            .all(|x| x.public_probability < 0.64 && x.expected_value < 0.0));
+        let publication = super::daily_selections::publication(&c, &run.business_date).unwrap();
+        let visible = super::daily_selections::view(&c, &publication).unwrap();
+        for x in &pool {
+            assert_eq!(
+                visible.selection_sources[&x.id].selection_status,
+                "DAILY_RANKED"
+            );
+            assert!(!visible.selection_sources[&x.id].strict_qualified);
+        }
+        let coupons = coupon_engine::generate_daily(
+            &c,
+            &coupon_engine::GenerateRequest {
+                business_date: run.business_date.clone(),
+                candidate_run_id: Some(run.run_id),
+                coupon_type: Some(kind.into()),
+                unit_stake_cents: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(coupons.len(), 1);
+        assert_eq!(
+            coupons[0].candidate_ids,
+            pool.iter()
+                .take(if kind == "DAILY_OVER_25" { 5 } else { 7 })
+                .map(|x| x.id)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            coupons[0].selections.len(),
+            if kind == "DAILY_OVER_25" { 5 } else { 7 }
+        );
+    }
+}
+
+#[test]
+fn inspecting_coupon_without_lineups_preserves_base_coupons() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    let run = phase7_run(&c);
+    let coupons = coupon_engine::generate_daily(
+        &c,
+        &coupon_engine::GenerateRequest {
+            business_date: run.business_date.clone(),
+            candidate_run_id: Some(run.run_id),
+            coupon_type: Some("DAILY_OVER_25".into()),
+            unit_stake_cents: None,
+        },
+    )
+    .unwrap();
+    assert!(!coupons.is_empty());
+    let before: i64 = c
+        .query_row("SELECT COUNT(*) FROM candidate_engine_runs", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let impact = coupon_engine::lineup_revision_impact(
+        &c,
+        &coupon_engine::LineupRevisionImpactRequest {
+            coupon_id: coupons[0].id,
+        },
+    )
+    .unwrap();
+    assert!(impact.latest_lineup_candidate_run_id.is_none());
+    let after: i64 = c
+        .query_row("SELECT COUNT(*) FROM candidate_engine_runs", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(before, after);
+    // An older read-side comparison run must not suppress a valid BASE draft either.
+    candidate_engine::generate_lineup_revision(
+        &c,
+        &candidate_engine::LineupRevisionGenerateRequest {
+            base_run_id: run.run_id,
+            business_date: run.business_date.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        coupon_engine::get_daily(&c, &run.business_date, None)
+            .unwrap()
+            .len(),
+        coupons.len()
+    );
+}
+
 fn clone_candidate_for_conflict(
     c: &rusqlite::Connection,
     source_id: i64,
@@ -60,7 +462,7 @@ fn clone_candidate_for_conflict(
             |x| Ok((x.get(0)?, x.get(1)?)),
         )
         .unwrap();
-    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_sample_size,availability) VALUES(?1,?2,?3,?4,0.80,'phase8-conflict','2026-09-02T12:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal_v1','0.8',25,'AVAILABLE')", rusqlite::params![match_id, market, selection, line]).unwrap();
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_sample_size,availability,created_at) VALUES(?1,?2,?3,?4,0.80,'phase8-conflict','2026-09-02T12:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal_v1','0.8',25,'AVAILABLE','2026-09-02T11:00:00Z')", rusqlite::params![match_id, market, selection, line]).unwrap();
     let prediction_id = c.last_insert_rowid();
     c.execute("INSERT INTO candidate_engine_candidates(run_id,prediction_id,match_id,competition_id,category,market,selection,line_value,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_observed_rate,bucket_sample_size,bucket_calibration_gap,iddaa_odd,odds_snapshot_id,odds_captured_at,implied_probability,probability_edge,expected_value,data_quality,score,score_components_json,rank,same_match_group,correlation_type,compound_eligible,qualification_state) SELECT run_id,?2,match_id,competition_id,?3,?4,?5,?6,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_observed_rate,bucket_sample_size,bucket_calibration_gap,?7,odds_snapshot_id,odds_captured_at,1.0/?7,public_probability-1.0/?7,public_probability*?7-1.0,data_quality,score,score_components_json,?8,same_match_group,correlation_type,compound_eligible,'QUALIFIED' FROM candidate_engine_candidates WHERE id=?1", rusqlite::params![source_id, prediction_id, category, market, selection, line, odd, 1000 + prediction_id]).unwrap();
     c.last_insert_rowid()
@@ -110,22 +512,8 @@ fn phase8_system_snapshot_and_katlama_state_contract() {
     )
     .is_err());
     let s = coupon_engine::start_series(&c, "2026-09-02", 10000).unwrap();
-    assert_eq!(s.current_step, 1);
-    let s = coupon_engine::settle_series(&c, s.id, true, 16000).unwrap();
-    assert_eq!(s.current_step, 2);
-    let s = coupon_engine::settle_series(&c, s.id, false, 0).unwrap();
-    assert_eq!(s.current_step, 1);
-    assert_eq!(s.current_stake_cents, 10000);
-    assert_eq!(s.reset_count, 1);
-    coupon_engine::cancel_series(&c, s.id).unwrap();
-    let final_series = coupon_engine::start_series(&c, "2026-09-02", 10000).unwrap();
-    for _ in 0..6 {
-        coupon_engine::settle_series(&c, final_series.id, true, 16000).unwrap();
-    }
-    let completed = coupon_engine::settle_series(&c, final_series.id, true, 16000).unwrap();
-    assert_eq!(completed.status, "COMPLETED");
-    assert_eq!(completed.current_step, 7);
-    assert!(coupon_engine::generate_compound_step(&c, "2026-09-02", Some(run.run_id)).is_err());
+    assert!(coupon_engine::settle_series(&c, s.id, true, 16000).is_err());
+    assert_eq!(coupon_engine::series(&c, s.id).unwrap().current_step, 1);
 }
 
 #[test]
@@ -151,19 +539,26 @@ fn phase8_accumulator_system_void_and_idempotent_settlement() {
         },
     )
     .unwrap();
-    let one = source
+    let _one = source
         .candidates
         .iter()
         .find(|x| x.category == "OVER_25")
         .unwrap()
         .id;
+    let five: Vec<i64> = source
+        .candidates
+        .iter()
+        .filter(|x| x.category == "OVER_25")
+        .take(5)
+        .map(|x| x.id)
+        .collect();
     let draft = coupon_engine::create_draft(
         &c,
         &coupon_engine::DraftRequest {
             business_date: "2026-09-02".into(),
             candidate_run_id: run.run_id,
             coupon_type: "DAILY_OVER_25".into(),
-            candidate_ids: vec![one],
+            candidate_ids: five.clone(),
             unit_stake_cents: Some(1000),
         },
     )
@@ -173,16 +568,19 @@ fn phase8_accumulator_system_void_and_idempotent_settlement() {
         &c,
         &coupon_engine::SettlementRequest {
             coupon_id: draft.id,
-            outcomes: vec![coupon_engine::SelectionOutcome {
-                candidate_id: one,
-                result: "WON".into(),
-            }],
+            outcomes: five
+                .iter()
+                .map(|id| coupon_engine::SelectionOutcome {
+                    candidate_id: *id,
+                    result: "WON".into(),
+                })
+                .collect(),
             settled_at: "2026-09-02T13:00:00Z".into(),
         },
     )
     .unwrap();
     assert_eq!(won.status, "WON");
-    assert_eq!(won.gross_return_cents, 2600);
+    assert_eq!(won.gross_return_cents, 118814);
     assert_eq!(
         coupon_engine::settle(
             &c,
@@ -195,19 +593,26 @@ fn phase8_accumulator_system_void_and_idempotent_settlement() {
         .unwrap(),
         won
     );
-    let high = source
+    let _high = source
         .candidates
         .iter()
         .find(|x| x.category == "HIGH_CONFIDENCE")
         .unwrap()
         .id;
+    let five_high: Vec<i64> = source
+        .candidates
+        .iter()
+        .filter(|x| x.category == "HIGH_CONFIDENCE")
+        .take(5)
+        .map(|x| x.id)
+        .collect();
     let void_draft = coupon_engine::create_draft(
         &c,
         &coupon_engine::DraftRequest {
             business_date: "2026-09-02".into(),
             candidate_run_id: run.run_id,
             coupon_type: "DAILY_HIGH_CONFIDENCE".into(),
-            candidate_ids: vec![high],
+            candidate_ids: five_high.clone(),
             unit_stake_cents: Some(1000),
         },
     )
@@ -217,10 +622,13 @@ fn phase8_accumulator_system_void_and_idempotent_settlement() {
         &c,
         &coupon_engine::SettlementRequest {
             coupon_id: void_draft.id,
-            outcomes: vec![coupon_engine::SelectionOutcome {
-                candidate_id: high,
-                result: "VOID".into(),
-            }],
+            outcomes: five_high
+                .iter()
+                .map(|id| coupon_engine::SelectionOutcome {
+                    candidate_id: *id,
+                    result: "VOID".into(),
+                })
+                .collect(),
             settled_at: "2026-09-02T13:00:00Z".into(),
         },
     )
@@ -570,10 +978,10 @@ fn phase8_all_ordinary_coupon_types_share_settlement_router() {
                 .candidates
                 .iter()
                 .filter(|x| x.category == category)
-                .take(if kind == "DAILY_COMPOUND" { 2 } else { 1 })
+                .take(if kind == "DAILY_COMPOUND" { 2 } else { 5 })
                 .map(|x| x.id)
                 .collect();
-            if ids.len() < if kind == "DAILY_COMPOUND" { 2 } else { 1 } {
+            if ids.len() < if kind == "DAILY_COMPOUND" { 2 } else { 5 } {
                 continue;
             }
             let draft = coupon_engine::create_draft(
@@ -763,6 +1171,14 @@ fn phase8_replacement_and_correlation_acceptance_matrix() {
         .unwrap_err(),
         "CANDIDATE_FROM_DIFFERENT_RUN"
     );
+    coupon_engine::update_draft(
+        &c,
+        &coupon_engine::UpdateRequest {
+            coupon_id: draft.id,
+            candidate_ids: goals.iter().take(5).copied().collect(),
+        },
+    )
+    .unwrap();
     let finalized = coupon_engine::finalize(&c, draft.id).unwrap();
     assert_eq!(
         coupon_engine::update_draft(
@@ -914,6 +1330,14 @@ fn phase8_final_replacement_conflict_matrix() {
         "NESTED_TOTAL_CONFLICT"
     );
     assert_eq!(coupon_engine::get_coupon(&c, draft.id).unwrap(), before);
+    coupon_engine::update_draft(
+        &c,
+        &coupon_engine::UpdateRequest {
+            coupon_id: draft.id,
+            candidate_ids: surprise[1..8].to_vec(),
+        },
+    )
+    .unwrap();
     let finalized = coupon_engine::finalize(&c, draft.id).unwrap();
     assert_eq!(
         coupon_engine::update_draft(
@@ -1156,7 +1580,8 @@ fn phase8_katlama_generation_void_and_cancellation() {
     let after_win = coupon_engine::series(&c, series.id).unwrap();
     assert_eq!(after_win.current_step, 2);
     assert_eq!(after_win.current_stake_cents, won.gross_return_cents);
-    let after_void = coupon_engine::settle_series_result(&c, series.id, "VOID", 0).unwrap();
+    assert!(coupon_engine::settle_series_result(&c, series.id, "VOID", 0).is_err());
+    let after_void = coupon_engine::series(&c, series.id).unwrap();
     assert_eq!(after_void.current_step, 2);
     assert_eq!(
         after_void.current_stake_cents,
@@ -1181,8 +1606,8 @@ fn phase8_controlled_daily_coupon_acceptance_report() {
     for id in 20..=24 {
         let home = (id - 20) * 2 + 39;
         c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(1,'2026/27',?1,?2,?3,'scheduled','2026-09-02',1)", rusqlite::params![home, home + 1, format!("2026-09-02T{}:00:00Z", 16 + id - 20)]).unwrap();
-        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,'fe_v1','2026-09-02T12:00:00Z','{}','{\"history_matches_home\":8,\"history_matches_away\":8}')", [id]).unwrap();
-        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability) VALUES(?1,'TOTAL_GOALS','OVER',2.5,0.80,'p8','2026-09-02T12:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal_v1',25,'AVAILABLE')", [id]).unwrap();
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(?1,'fe_v1','2026-09-02T12:00:00Z','{}','{\"history_matches_home\":8,\"history_matches_away\":8}','2026-09-02T10:00:00Z')", [id]).unwrap();
+        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) VALUES(?1,'TOTAL_GOALS','OVER',2.5,0.80,'p8','2026-09-02T12:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal_v1',25,'AVAILABLE','2026-09-02T11:00:00Z')", [id]).unwrap();
         c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(?1,'iddaa','phase8','TOTAL_GOALS','OVER',2.40,'TOTAL_GOALS','OVER',2.5,'2026-09-02T11:00:00Z')", [id]).unwrap();
     }
     let started = std::time::Instant::now();
@@ -1249,23 +1674,8 @@ fn phase8_controlled_daily_coupon_acceptance_report() {
         "EXCLUSIONS BY REASON {:?}\nPHASE 8 GENERATION MS {}",
         reasons, elapsed
     );
-    assert_eq!(coupons.len(), 7);
-    for kind in [
-        "DAILY_CORNERS",
-        "DAILY_OVER_25",
-        "DAILY_OVER_35",
-        "DAILY_BTTS",
-        "DAILY_HIGH_CONFIDENCE",
-        "DAILY_SURPRISE_SYSTEM",
-        "DAILY_COMPOUND",
-    ] {
-        assert!(
-            coupons
-                .iter()
-                .any(|x| x.coupon_type == kind && !x.candidate_ids.is_empty()),
-            "missing {kind}"
-        );
-    }
+    assert_eq!(coupons.len(), 4);
+    assert!(coupons.iter().all(coupon_engine::rule_compliant));
     let surprise = coupons
         .iter()
         .find(|x| x.coupon_type == "DAILY_SURPRISE_SYSTEM")
@@ -1289,8 +1699,8 @@ fn phase8_100_match_coupon_benchmark() {
         let match_id = 20 + i;
         let home = 51 + i * 2;
         c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(2,'2026/27',?1,?2,?3,'scheduled','2026-09-02',1)", rusqlite::params![home, home + 1, format!("2026-09-03T{:02}:00:00Z", i % 24)]).unwrap();
-        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,'fe_v1','2026-09-02T12:00:00Z','{}','{\"history_matches_home\":8,\"history_matches_away\":8}')", [match_id]).unwrap();
-        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability) VALUES(?1,'TOTAL_GOALS','OVER',2.5,0.80,'bench','2026-09-02T12:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal_v1',25,'AVAILABLE')", [match_id]).unwrap();
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(?1,'fe_v1','2026-09-02T12:00:00Z','{}','{\"history_matches_home\":8,\"history_matches_away\":8}','2026-09-02T10:00:00Z')", [match_id]).unwrap();
+        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) VALUES(?1,'TOTAL_GOALS','OVER',2.5,0.80,'bench','2026-09-02T12:00:00Z',1,0.80,0.80,'CALIBRATED_V1','cal_v1',25,'AVAILABLE','2026-09-02T11:00:00Z')", [match_id]).unwrap();
         c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(?1,'iddaa','bench','TOTAL_GOALS','OVER',1.30,'TOTAL_GOALS','OVER',2.5,'2026-09-02T11:00:00Z')", [match_id]).unwrap();
     }
     let started = std::time::Instant::now();
@@ -1428,8 +1838,8 @@ fn phase8_katlama_seven_distinct_candidate_runs_and_history() {
         assert_eq!(settled.status, "WON");
     }
     let final_state = coupon_engine::series(&c, series.id).unwrap();
-    assert_eq!(final_state.status, "COMPLETED");
-    assert_eq!(final_state.current_step, 7);
+    assert_eq!(final_state.status, "ACTIVE");
+    assert_eq!(final_state.current_step, 1);
     assert_eq!(
         c.query_row::<i64, _, _>(
             "SELECT COUNT(*) FROM phase8_series_steps WHERE series_id=?1",
@@ -1516,4 +1926,151 @@ fn phase8_katlama_reset_preserves_history_and_creates_new_step_one() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(steps, vec![1, 2, 3, 1]);
+}
+
+#[test]
+fn product_minimums_and_corner_maximum_are_enforced_at_publication() {
+    for (kind, cat, market, selection, line) in [
+        (
+            "DAILY_CORNERS",
+            "CORNERS",
+            "FULL_TIME_TOTAL_CORNERS",
+            "OVER",
+            Some(8.5),
+        ),
+        ("DAILY_OVER_25", "OVER_25", "TOTAL_GOALS", "OVER", Some(2.5)),
+        ("DAILY_OVER_35", "OVER_35", "TOTAL_GOALS", "OVER", Some(3.5)),
+        ("DAILY_BTTS", "BTTS_YES", "BTTS", "YES", None),
+        (
+            "DAILY_HIGH_CONFIDENCE",
+            "HIGH_CONFIDENCE",
+            "TOTAL_GOALS",
+            "OVER",
+            Some(2.5),
+        ),
+    ] {
+        for n in [2, 3, 4, 5, 7, 8] {
+            let goal = matches!(kind, "DAILY_OVER_25" | "DAILY_OVER_35");
+            let minimum = if goal { 3 } else { 5 };
+            let db = fixture();
+            let c = db.connection().unwrap();
+            // Test inputs are populated before immutable snapshots are generated.
+            c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) SELECT match_id,'fe_v1','2026-09-02T11:01:00Z','{}',json_set(data_quality_json,'$.corners_coverage',1.0),'2026-09-02T11:01:00Z' FROM feature_sets",[]).unwrap();
+            c.execute(
+                "INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) SELECT match_id,?1,?2,?3,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,'2026-09-02T11:02:00Z' FROM predictions",
+                params![market, selection, line],
+            )
+            .unwrap();
+            c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT id,'iddaa','rules',?1,?2,2.6,?1,?2,?3,'2026-09-02T11:00:00Z' FROM matches WHERE id<=?4",params![market,selection,line,n]).unwrap();
+            c.execute("UPDATE matches SET status='cancelled' WHERE id>?1", [n])
+                .unwrap();
+            let run = phase7_run(&c);
+            let ids: Vec<i64> = run
+                .candidates
+                .iter()
+                .filter(|x| x.category == cat)
+                .map(|x| x.id)
+                .collect();
+            assert_eq!(ids.len(), n as usize, "{kind}");
+            let generated = coupon_engine::generate_daily(
+                &c,
+                &coupon_engine::GenerateRequest {
+                    business_date: run.business_date.clone(),
+                    candidate_run_id: Some(run.run_id),
+                    coupon_type: Some(kind.into()),
+                    unit_stake_cents: None,
+                },
+            )
+            .unwrap();
+            if n < minimum {
+                assert!(generated.is_empty(), "{kind}");
+                let draft = coupon_engine::create_draft(
+                    &c,
+                    &coupon_engine::DraftRequest {
+                        business_date: run.business_date,
+                        candidate_run_id: run.run_id,
+                        coupon_type: kind.into(),
+                        candidate_ids: ids,
+                        unit_stake_cents: None,
+                    },
+                )
+                .unwrap();
+                assert_eq!(draft.publication_status, "INSUFFICIENT");
+                assert!(coupon_engine::finalize(&c, draft.id).is_err());
+            } else {
+                assert_eq!(generated.len(), 1, "{kind}");
+                assert_eq!(generated[0].publication_status, "READY");
+                assert!(generated[0].selections.len() >= minimum as usize);
+                if goal {
+                    assert_eq!(generated[0].selections.len(), (n as usize).min(5));
+                }
+                if matches!(kind, "DAILY_CORNERS" | "DAILY_BTTS") {
+                    assert_eq!(generated[0].selections.len(), (n as usize).min(7));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn product_series_survives_reopen_and_pending_refresh() {
+    let source = fixture_with_odd(1.30);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("persist.sqlite3");
+    {
+        let c = source.connection().unwrap();
+        c.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+    }
+    let (series_id, coupon_id);
+    {
+        let db = Database::open(path.clone()).unwrap();
+        let c = db.connection().unwrap();
+        let run = phase7_run(&c);
+        let series = coupon_engine::start_series(&c, "2026-09-02", 10000).unwrap();
+        series_id = series.id;
+        let coupon =
+            coupon_engine::generate_compound_step(&c, "2026-09-02", Some(run.run_id)).unwrap();
+        coupon_id = coupon.id;
+        assert!(coupon_engine::settle_series(&c, series_id, true, 100000).is_err());
+        assert_eq!(
+            coupon_engine::generate_compound_step(&c, "2026-09-03", None)
+                .unwrap()
+                .id,
+            coupon_id
+        );
+    }
+    {
+        let db = Database::open(path).unwrap();
+        let c = db.connection().unwrap();
+        let series = coupon_engine::series(&c, series_id).unwrap();
+        assert_eq!(series.current_step, 1);
+        assert_eq!(series.latest_coupon_id, Some(coupon_id));
+        assert_eq!(series.history[0].result, "UNSETTLED");
+        let empty = candidate_engine::generate(
+            &c,
+            &candidate_engine::GenerateRequest {
+                business_date: Some("2026-09-03".into()),
+                generation_time: Some("2026-09-03T12:00:00Z".into()),
+                category: None,
+                dry_run: Some(false),
+            },
+        )
+        .unwrap();
+        assert!(empty.candidates.is_empty());
+        assert_eq!(coupon_engine::series(&c, series_id).unwrap(), series);
+        // An attached pending step is independent of a later publication.
+        // Simulate publication replacement without modifying immutable coupon inputs.
+        c.execute("INSERT INTO daily_output_publications(business_date,candidate_run_id) VALUES('2026-09-02',?1) ON CONFLICT(business_date) DO UPDATE SET candidate_run_id=excluded.candidate_run_id",[empty.run_id]).unwrap();
+        let visible = coupon_engine::get_daily(&c, "2026-09-02", Some("DAILY_COMPOUND")).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, coupon_id);
+        assert_eq!(visible[0].publication_status, "READY");
+        assert_eq!(
+            coupon_engine::generate_compound_step(&c, "2026-09-03", None)
+                .unwrap()
+                .id,
+            coupon_id
+        );
+    }
 }

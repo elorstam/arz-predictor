@@ -1,6 +1,26 @@
 use std::{collections::HashMap, path::Path, time::Instant};
 
 use chrono::{DateTime, Datelike, Utc};
+fn business_date(kickoff: &DateTime<Utc>) -> String {
+    kickoff
+        .with_timezone(&chrono_tz::Europe::Istanbul)
+        .date_naive()
+        .to_string()
+}
+
+#[test]
+fn bulletin_business_date_rolls_over_at_istanbul_midnight() {
+    for (timestamp, expected) in [
+        ("2026-09-11T20:59:00Z", "2026-09-11"),
+        ("2026-09-11T21:00:00Z", "2026-09-12"),
+        ("2026-09-12T21:30:00Z", "2026-09-13"),
+    ] {
+        let kickoff = DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(business_date(&kickoff), expected);
+    }
+}
 use serde::Serialize;
 
 use super::{
@@ -41,6 +61,7 @@ pub struct RefreshSummary {
 }
 
 pub async fn refresh_bulletin(database: &Database) -> Result<RefreshSummary, String> {
+    let refresh_started = Instant::now();
     let competition_run_id = start_dataset_run(database, "iddaa:competitions", COMPETITIONS_URL)?;
     let competition_bytes = download_json(COMPETITIONS_URL).await;
     let (competitions, competition_error) = match competition_bytes {
@@ -67,14 +88,16 @@ pub async fn refresh_bulletin(database: &Database) -> Result<RefreshSummary, Str
             return Err(error.to_string());
         }
     };
-    finish_import(
+    let mut summary = finish_import(
         database,
         run_id,
         EVENTS_URL,
         &bytes,
         competitions,
         competition_error,
-    )
+    )?;
+    summary.elapsed_ms = refresh_started.elapsed().as_millis();
+    Ok(summary)
 }
 
 pub fn import_local_bulletin(database: &Database, path: &Path) -> Result<RefreshSummary, String> {
@@ -88,6 +111,13 @@ pub fn import_local_bulletin(database: &Database, path: &Path) -> Result<Refresh
         }
     };
     finish_import(database, run_id, &source, &bytes, Vec::new(), None)
+}
+
+/// The BTTS recovery path fetches the provider but changes no other markets.
+pub async fn download_btts_bulletin() -> Result<(Vec<u8>, String), String> {
+    let bytes = download_json(EVENTS_URL).await.map_err(|e| e.to_string())?;
+    parse_bulletin(&bytes)?;
+    Ok((bytes, Utc::now().to_rfc3339()))
 }
 
 #[cfg(test)]
@@ -169,8 +199,10 @@ fn finish_import(
 
     let result = (|| -> Result<(), String> {
         let mut connection = database.connection()?;
+        // Reserve the writer before identity reads: upgrading a WAL read snapshot
+        // after another background writer commits fails without honoring busy_timeout.
         let mut transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let mut competition_outcomes: HashMap<i64, bool> = HashMap::new();
         for event in parsed.events {
@@ -223,6 +255,10 @@ fn finish_import(
             .values()
             .filter(|resolved| !**resolved)
             .count();
+        if summary.matches_inserted + summary.matches_updated > 0 && summary.failed_events == 0 {
+            iddaa::mark_events_missing_from_refresh_inactive(&transaction, &captured_at)
+                .map_err(|error| error.to_string())?;
+        }
         transaction.commit().map_err(|error| error.to_string())?;
         iddaa::complete_run(
             &connection,
@@ -298,16 +334,30 @@ fn import_event(
         return Ok(EventOutcome::UnresolvedCompetition(competition_id));
     };
     let country = metadata.and_then(|value| value.country.as_deref());
-    let home_team =
-        iddaa::resolve_team(connection, home, country).map_err(|error| error.to_string())?;
-    let away_team =
-        iddaa::resolve_team(connection, away, country).map_err(|error| error.to_string())?;
+    let home_team = crate::repositories::incremental_resolution::team(
+        connection,
+        &event_id.to_string(),
+        competition.id,
+        home,
+        true,
+        country,
+    )
+    .map_err(|error| error.to_string())?;
+    let away_team = crate::repositories::incremental_resolution::team(
+        connection,
+        &event_id.to_string(),
+        competition.id,
+        away,
+        false,
+        country,
+    )
+    .map_err(|error| error.to_string())?;
     let season = metadata
         .and_then(|value| value.season.as_deref())
         .map(str::to_string)
         .unwrap_or_else(|| kickoff.year().to_string());
     let kickoff_at = kickoff.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let local_date = kickoff.date_naive().to_string();
+    let local_date = business_date(&kickoff);
     let external_event_id = event_id.to_string();
     let (match_id, match_inserted) = iddaa::upsert_match(
         connection,
@@ -323,6 +373,8 @@ fn import_event(
     )
     .map_err(|error| error.to_string())?;
 
+    crate::repositories::incremental_resolution::enqueue(connection, match_id, &external_event_id)
+        .map_err(|e| e.to_string())?;
     let mut outcome = EventImportOutcome {
         teams_created: usize::from(home_team.created) + usize::from(away_team.created),
         match_inserted,

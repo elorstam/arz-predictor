@@ -8,6 +8,32 @@ use crate::{database::Database, repositories::iddaa};
 const BULLETIN: &str = include_str!("fixtures/bulletin.json");
 const POPULAR_BETS: &str = include_str!("fixtures/popular_bets.json");
 
+#[test]
+fn failed_popularity_rows_cannot_be_reported_as_a_successful_refresh() {
+    let db = Database::open_in_memory().unwrap();
+    let mut payload: serde_json::Value = serde_json::from_str(POPULAR_BETS).unwrap();
+    for row in payload["data"]["1"].as_array_mut().unwrap() {
+        row["totalPlayed"] = serde_json::json!(-1);
+    }
+    let error =
+        super::popularity::import_fixture(&db, &serde_json::to_vec(&payload).unwrap()).unwrap_err();
+    assert!(error.contains("POPULARITY_IMPORT_FAILED"));
+    {
+        let c = db.connection().unwrap();
+        let status: String = c
+            .query_row(
+                "SELECT status FROM data_import_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+    }
+    let recovered = super::popularity::import_fixture(&db, POPULAR_BETS.as_bytes()).unwrap();
+    assert_eq!(recovered.selections_failed, 0);
+    assert!(recovered.selections_imported > 0);
+}
+
 fn seed_popular_match(database: &Database) -> i64 {
     let connection = database.connection().unwrap();
     connection
@@ -252,7 +278,7 @@ fn fixture_imports_matches_mappings_and_all_observed_market_shapes() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(cautious_48, "UNKNOWN");
+    assert_eq!(cautious_48, "CORNERS_TOTAL");
 }
 
 #[test]

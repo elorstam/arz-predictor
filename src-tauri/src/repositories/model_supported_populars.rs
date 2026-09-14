@@ -20,12 +20,14 @@ pub struct GetRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum SupportStatus {
+    ModelUnsupported,
     ModelSupported,
     ModelNotSupported,
     ModelBelowPolicy,
     ModelDataUnavailable,
     MarketNotSupported,
     Unresolved,
+    InvalidOdds,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -37,6 +39,11 @@ pub enum ResolutionStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelSupportedPopularItem {
+    pub market_display_name: Option<String>,
+    pub provider_event_id: String,
+    pub provider_market_id: Option<String>,
+    pub provider_selection_id: Option<String>,
+    pub odds_snapshot_id: Option<i64>,
     pub popularity_rank: i64,
     pub total_played: i64,
     pub total_played_round_str: Option<String>,
@@ -72,6 +79,7 @@ pub struct ModelSupportedPopularItem {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelSupportedPopularResponse {
+    pub publication_id: Option<String>,
     pub business_date: String,
     pub popularity_snapshot_id: Option<i64>,
     pub popularity_snapshot_at: Option<String>,
@@ -99,6 +107,12 @@ struct EffectiveRun {
 
 #[derive(Debug, Clone)]
 struct PopularRow {
+    market_display_name: Option<String>,
+    provider_event_id: String,
+    provider_market_id: Option<String>,
+    provider_selection_id: Option<String>,
+    odds_snapshot_id: Option<i64>,
+    odds: Option<f64>,
     snapshot_id: i64,
     rank: i64,
     total_played: i64,
@@ -126,9 +140,6 @@ struct CandidateRow {
     id: i64,
     probability: f64,
     odds: f64,
-    implied: f64,
-    edge: f64,
-    ev: f64,
     calibration_version: Option<String>,
     source: Option<String>,
     lineup_revision_id: Option<i64>,
@@ -165,35 +176,8 @@ fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EffectiveRun> {
 }
 
 fn effective_run(c: &Connection, date: &str) -> Result<Option<EffectiveRun>, String> {
-    let base: Option<EffectiveRun> = c
-        .query_row(
-            "SELECT id,COALESCE(prediction_context,'BASE'),model_version,
-                    calibration_version,lineup_model_version,odds_cutoff_at
-             FROM candidate_engine_runs
-             WHERE business_date=?1 AND status='COMPLETED'
-               AND COALESCE(prediction_context,'BASE')='BASE'
-             ORDER BY generated_at DESC,id DESC LIMIT 1",
-            [date],
-            run_from_row,
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    let Some(base) = base else {
-        return Ok(None);
-    };
-    c.query_row(
-        "SELECT id,prediction_context,model_version,calibration_version,
-                lineup_model_version,odds_cutoff_at
-         FROM candidate_engine_runs
-         WHERE parent_candidate_run_id=?1 AND business_date=?2 AND status='COMPLETED'
-           AND prediction_context='LINEUP_AWARE'
-         ORDER BY id DESC LIMIT 1",
-        params![base.id, date],
-        run_from_row,
-    )
-    .optional()
-    .map(|lineup| lineup.or(Some(base)))
-    .map_err(|e| e.to_string())
+    let id = super::candidate_engine::selected_run_id(c, date)?;
+    match id {Some(id)=>c.query_row("SELECT id,COALESCE(prediction_context,'BASE'),model_version,calibration_version,lineup_model_version,odds_cutoff_at FROM candidate_engine_runs WHERE id=?1",[id],run_from_row).optional().map_err(|e|e.to_string()),None=>Ok(None)}
 }
 
 fn popular_rows(c: &Connection, date: &str) -> Result<Vec<PopularRow>, String> {
@@ -213,9 +197,12 @@ fn popular_rows(c: &Connection, date: &str) -> Result<Vec<PopularRow>, String> {
              )
              SELECT counts.id,ranks.rank_value,CAST(counts.metric_value AS INTEGER),
                     counts.provider_raw_value,counts.captured_at,
-                    COALESCE(counts.match_id,mapping.match_id),m.kickoff_at,
+                    COALESCE(mapping.match_id,counts.match_id),m.kickoff_at,
                     competition.name,home.normalized_name,away.normalized_name,
-                    counts.market_type,counts.selection,counts.line_value
+                    COALESCE(o.normalized_market_type,NULLIF(counts.market_type,'UNKNOWN')),
+                    COALESCE(o.normalized_selection,counts.selection),
+                    CASE WHEN o.id IS NOT NULL THEN o.line_value ELSE counts.line_value END,
+                    counts.provider_event_id,counts.provider_market_id,counts.provider_selection_code,o.id,COALESCE(o.odd,quote.odd),quote.market_name
              FROM counts
              JOIN ranks ON ranks.provider_event_id=counts.provider_event_id
                 AND ranks.provider_market_id IS counts.provider_market_id
@@ -223,11 +210,20 @@ fn popular_rows(c: &Connection, date: &str) -> Result<Vec<PopularRow>, String> {
              LEFT JOIN provider_match_mappings mapping
                 ON mapping.provider='iddaa'
                AND mapping.external_match_id=counts.provider_event_id
-             LEFT JOIN matches m ON m.id=COALESCE(counts.match_id,mapping.match_id)
+             LEFT JOIN matches m ON m.id=COALESCE(mapping.match_id,counts.match_id)
+             LEFT JOIN odds_snapshots o ON o.id=(SELECT x.id FROM odds_snapshots x
+               WHERE x.match_id=m.id AND x.provider='iddaa'
+                 AND x.provider_market_id=counts.provider_market_id
+                 AND x.provider_selection_code=counts.provider_selection_code
+               ORDER BY x.captured_at DESC,x.id DESC LIMIT 1)
              LEFT JOIN competitions competition ON competition.id=m.competition_id
+             LEFT JOIN popularity_selection_quotes quote ON quote.provider_event_id=counts.provider_event_id AND quote.provider_market_id=counts.provider_market_id AND quote.provider_selection_code=counts.provider_selection_code AND quote.captured_at=(SELECT max(q.captured_at) FROM popularity_selection_quotes q WHERE q.provider_event_id=counts.provider_event_id AND q.provider_market_id=counts.provider_market_id AND q.provider_selection_code=counts.provider_selection_code)
              LEFT JOIN teams home ON home.id=m.home_team_id
              LEFT JOIN teams away ON away.id=m.away_team_id
-             WHERE m.id IS NULL OR m.scheduled_local_date=?1
+             WHERE (m.scheduled_local_date=?1
+                OR (m.id IS NULL AND date(counts.captured_at,'+3 hours')=?1))
+               AND (NOT EXISTS(SELECT 1 FROM popularity_selection_quotes q WHERE date(q.captured_at,'+3 hours')=?1)
+                 OR quote.captured_at=(SELECT max(q.captured_at) FROM popularity_selection_quotes q WHERE date(q.captured_at,'+3 hours')=?1))
              ORDER BY ranks.rank_value ASC,counts.provider_event_id ASC,
                       COALESCE(counts.provider_market_id,''),
                       COALESCE(counts.provider_selection_code,'')",
@@ -249,6 +245,12 @@ fn popular_rows(c: &Connection, date: &str) -> Result<Vec<PopularRow>, String> {
                 market: row.get(10)?,
                 raw_selection: row.get(11)?,
                 line: row.get(12)?,
+                provider_event_id: row.get(13)?,
+                provider_market_id: row.get(14)?,
+                provider_selection_id: row.get(15)?,
+                odds_snapshot_id: row.get(16)?,
+                odds: row.get(17)?,
+                market_display_name: row.get(18)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -347,9 +349,6 @@ fn candidate(
                 id: row.get(0)?,
                 probability: row.get(1)?,
                 odds: row.get(2)?,
-                implied: row.get(3)?,
-                edge: row.get(4)?,
-                ev: row.get(5)?,
                 calibration_version: row.get(6)?,
                 source: row.get(7)?,
                 lineup_revision_id: row.get(8)?,
@@ -374,13 +373,15 @@ fn prediction(
          WHERE p.match_id=?1 AND p.market=?2 AND p.selection=?3
            AND (p.line_value IS ?4 OR p.line_value=?4)
            AND mv.version_identifier=?5
+           AND julianday(p.created_at)<=julianday(?6)
          ORDER BY p.id DESC LIMIT 1",
         params![
             match_id,
             selection.market,
             selection.selection,
             selection.line,
-            run.model_version
+            run.model_version,
+            run.odds_cutoff_at
         ],
         |row| {
             Ok(PredictionRow {
@@ -504,6 +505,11 @@ fn analytics(probability: f64, odds: f64) -> (f64, f64, f64) {
 
 fn base_item(row: PopularRow, run: Option<&EffectiveRun>) -> ModelSupportedPopularItem {
     ModelSupportedPopularItem {
+        market_display_name: row.market_display_name,
+        provider_event_id: row.provider_event_id,
+        provider_market_id: row.provider_market_id,
+        provider_selection_id: row.provider_selection_id,
+        odds_snapshot_id: row.odds_snapshot_id,
         popularity_rank: row.rank,
         total_played: row.total_played,
         total_played_round_str: row.display,
@@ -518,9 +524,12 @@ fn base_item(row: PopularRow, run: Option<&EffectiveRun>) -> ModelSupportedPopul
         market: row.market.unwrap_or_else(|| "UNKNOWN".into()),
         selection: row.raw_selection.unwrap_or_default(),
         line: row.line,
-        odds: None,
+        odds: row.odds,
         model_probability: None,
-        implied_probability: None,
+        implied_probability: row
+            .odds
+            .filter(|x| x.is_finite() && *x > 1.0)
+            .map(|x| 1.0 / x),
         edge: None,
         expected_value: None,
         qualified: None,
@@ -550,6 +559,35 @@ fn project_item(
         item.reason = Some("POPULAR_MATCH_UNRESOLVED".into());
         return Ok(item);
     };
+    if super::model_coverage::classify(c, match_id).map_err(|e| e.to_string())?
+        == super::model_coverage::CoverageState::ModelUnsupported
+    {
+        item.support_status = SupportStatus::ModelUnsupported;
+        item.reason = Some("COMPETITION_OUTSIDE_MODEL_COVERAGE".into());
+        return Ok(item);
+    }
+    let provider_local_unresolved: bool = c
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM matches m
+                 JOIN provider_match_mappings pm ON pm.match_id=m.id AND pm.provider='iddaa'
+                 WHERE m.id=?1 AND (
+                   NOT EXISTS(SELECT 1 FROM provider_team_mappings h
+                              WHERE h.team_id=m.home_team_id AND h.provider<>'iddaa')
+                   OR NOT EXISTS(SELECT 1 FROM provider_team_mappings a
+                                 WHERE a.team_id=m.away_team_id AND a.provider<>'iddaa')
+                 )
+             )",
+            [match_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if provider_local_unresolved {
+        item.support_status = SupportStatus::Unresolved;
+        item.resolution_status = ResolutionStatus::Unresolved;
+        item.reason = Some("POPULAR_MATCH_UNRESOLVED".into());
+        return Ok(item);
+    }
     let selection = match canonical(&row) {
         Ok(selection) => selection,
         Err(status) => {
@@ -575,13 +613,24 @@ fn project_item(
         return Ok(item);
     };
     if let Some(candidate) = candidate(c, run.id, match_id, &selection)? {
-        item.odds = Some(candidate.odds);
+        item.odds = row.odds.or(Some(candidate.odds));
         item.model_probability = Some(candidate.probability);
-        item.implied_probability = Some(candidate.implied);
-        item.edge = Some(candidate.edge);
-        item.expected_value = Some(candidate.ev);
-        item.qualified = Some(true);
-        item.support_status = SupportStatus::ModelSupported;
+        let odds = item.odds.unwrap();
+        if !odds.is_finite() || odds <= 1.0 {
+            item.support_status = SupportStatus::InvalidOdds;
+            item.reason = Some("INVALID_ODDS".into());
+            return Ok(item);
+        }
+        let (implied, edge, ev) = analytics(candidate.probability, odds);
+        item.implied_probability = Some(implied);
+        item.edge = Some(edge);
+        item.expected_value = Some(ev);
+        item.qualified = Some(ev > 0.0);
+        item.support_status = if ev > 0.0 {
+            SupportStatus::ModelSupported
+        } else {
+            SupportStatus::ModelBelowPolicy
+        };
         item.prediction_source = candidate.source;
         item.candidate_id = Some(candidate.id);
         item.calibration_version = candidate
@@ -603,6 +652,17 @@ fn project_item(
         .map(|value| value.probability)
         .unwrap_or(prediction.probability);
     item.model_probability = Some(probability);
+    if let Some(odds) = row.odds {
+        if !odds.is_finite() || odds <= 1.0 {
+            item.support_status = SupportStatus::InvalidOdds;
+            item.reason = Some("INVALID_ODDS".into());
+            return Ok(item);
+        }
+        let (implied, edge, ev) = analytics(probability, odds);
+        item.implied_probability = Some(implied);
+        item.edge = Some(edge);
+        item.expected_value = Some(ev);
+    }
     item.calibration_version = prediction
         .calibration_version
         .or_else(|| run.calibration_version.clone());
@@ -643,7 +703,7 @@ fn project_item(
     item.qualified = Some(false);
     item.support_status = SupportStatus::ModelBelowPolicy;
     item.reason = Some(reason);
-    if let Some(odds) = current_odds(c, run, match_id, &selection)? {
+    if let Some(odds) = row.odds.or(current_odds(c, run, match_id, &selection)?) {
         let (implied, edge, ev) = analytics(probability, odds);
         item.odds = Some(odds);
         item.implied_probability = Some(implied);
@@ -697,6 +757,9 @@ pub fn get(c: &Connection, request: &GetRequest) -> Result<ModelSupportedPopular
         .take(limit)
         .collect();
     Ok(ModelSupportedPopularResponse {
+        publication_id: super::daily_selections::publication(c, &business_date)
+            .ok()
+            .map(|p| p.id),
         business_date,
         popularity_snapshot_id,
         popularity_snapshot_at,

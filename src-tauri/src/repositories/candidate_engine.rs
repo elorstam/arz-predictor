@@ -6,11 +6,160 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-pub const POLICY_VERSION: &str = "candidate_policy_v1";
+pub const POLICY_VERSION: &str = "candidate_policy_v2_daily_goal_ranking";
 pub const BUSINESS_TIMEZONE: &str = "Europe/Istanbul";
 pub const MAX_DAILY_ODDS_AGE_HOURS: i64 = 24;
 pub const TARGET_DISPLAY_RANGE: &str = "5-10";
-const CATEGORIES: [&str; 7] = [
+
+#[cfg(test)]
+mod daily_goal_ranking_tests {
+    use super::*;
+
+    fn input(category: &str) -> (P, O) {
+        (
+            P {
+                id: 1,
+                match_id: 1,
+                competition_id: 1,
+                market: if category == "BTTS_YES" {
+                    "BTTS"
+                } else {
+                    "TOTAL_GOALS"
+                }
+                .into(),
+                selection: if category == "BTTS_YES" {
+                    "YES"
+                } else {
+                    "OVER"
+                }
+                .into(),
+                line: if category == "BTTS_YES" {
+                    None
+                } else {
+                    Some(2.5)
+                },
+                raw: 0.58,
+                public: 0.58,
+                status: "UNCALIBRATED_V1".into(),
+                cal: None,
+                bucket: None,
+                observed: None,
+                n: None,
+                gap: None,
+                availability: "AVAILABLE".into(),
+                generated: "2026-09-02T12:00:00Z".into(),
+                match_status: "scheduled".into(),
+                quality_json: r#"{"history_matches_home":10,"history_matches_away":10}"#.into(),
+                goal_identity_valid: true,
+                kickoff_known: true,
+            },
+            O {
+                id: 1,
+                odd: 1.5,
+                captured: "2026-09-02T11:00:00Z".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn daily_goals_admit_low_probability_negative_ev_without_weakening_high_confidence() {
+        for category in ["OVER_25", "BTTS_YES"] {
+            let (mut p, o) = input(category);
+            assert!(p.public * o.odd < 1.0);
+            assert_eq!(reject(&p, category, &o, &policy()), None);
+            assert_eq!(
+                reject(&p, "HIGH_CONFIDENCE", &o, &policy()).as_deref(),
+                Some("LOW_PUBLIC_PROBABILITY")
+            );
+            p.public = 0.75;
+            assert_eq!(
+                reject(&p, "HIGH_CONFIDENCE", &o, &policy()).as_deref(),
+                Some("CALIBRATION_INSUFFICIENT")
+            );
+            p.status = "CALIBRATION_NOT_BENEFICIAL".into();
+            p.n = Some(20);
+            assert_eq!(reject(&p, "HIGH_CONFIDENCE", &o, &policy()), None);
+            p.n = Some(19);
+            assert!(reject(&p, "HIGH_CONFIDENCE", &o, &policy()).is_some());
+        }
+    }
+
+    #[test]
+    fn daily_goals_reject_invalid_stale_unresolved_and_proven_bad_inputs() {
+        for category in ["OVER_25", "BTTS_YES"] {
+            let (p, o) = input(category);
+            let mut x = p.clone();
+            x.goal_identity_valid = false;
+            assert_eq!(
+                reject(&x, category, &o, &policy()).as_deref(),
+                Some("RESOLUTION_FAILED")
+            );
+            x = p.clone();
+            x.kickoff_known = false;
+            assert_eq!(
+                reject(&x, category, &o, &policy()).as_deref(),
+                Some("KICKOFF_UNKNOWN")
+            );
+            x = p.clone();
+            x.quality_json = r#"{"history_matches_home":4,"history_matches_away":10}"#.into();
+            assert_eq!(
+                reject(&x, category, &o, &policy()).as_deref(),
+                Some("INSUFFICIENT_HISTORY")
+            );
+            x = p.clone();
+            x.public = f64::NAN;
+            assert_eq!(
+                reject(&x, category, &o, &policy()).as_deref(),
+                Some("INVALID_PROBABILITY")
+            );
+            x = p.clone();
+            x.public = 0.80;
+            x.observed = Some(0.40);
+            x.n = Some(100);
+            assert_eq!(
+                reject(&x, category, &o, &policy()).as_deref(),
+                Some("NEGATIVE_MODEL_QUALITY")
+            );
+            x.n = Some(10);
+            assert_eq!(reject(&x, category, &o, &policy()), None);
+            let mut quote = o.clone();
+            quote.captured = "2026-09-01T11:00:00Z".into();
+            assert_eq!(
+                reject(&p, category, &quote, &policy()).as_deref(),
+                Some("STALE_ODDS")
+            );
+            quote.captured = "2026-09-02T13:00:00Z".into();
+            assert_eq!(
+                reject(&p, category, &quote, &policy()).as_deref(),
+                Some("INVALID_ODDS")
+            );
+        }
+    }
+
+    #[test]
+    fn daily_goal_rank_uses_probability_then_ev_confidence_and_history() {
+        for category in ["OVER_25", "BTTS_YES"] {
+            let (mut p, o) = input(category);
+            let low = make(&p, &o, category);
+            p.public = 0.60;
+            let mut high = make(&p, &o, category);
+            high.expected_value = -0.8;
+            assert!(compare_candidates(&high, &low).is_lt());
+            let mut better = low.clone();
+            better.expected_value += 0.1;
+            assert!(compare_candidates(&better, &low).is_lt());
+            better = low.clone();
+            better.score_components.insert("confidence".into(), 0.9);
+            assert!(compare_candidates(&better, &low).is_lt());
+            better = low.clone();
+            better
+                .score_components
+                .insert("history_quality".into(), 0.5);
+            assert!(compare_candidates(&low, &better).is_lt());
+        }
+    }
+}
+pub(crate) const CATEGORIES: [&str; 7] = [
     "CORNERS",
     "OVER_25",
     "OVER_35",
@@ -40,6 +189,31 @@ pub struct CandidatePolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_newer_base_publication_cannot_hide_populated_base() {
+        let db = fixture();
+        let c = db.connection().unwrap();
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(1,'iddaa','test','TOTAL_GOALS','OVER',2.0,'TOTAL_GOALS','OVER',2.5,'2026-09-02T11:00:00Z')",[]).unwrap();
+        let base = generate(
+            &c,
+            &GenerateRequest {
+                business_date: Some("2026-09-02".into()),
+                generation_time: Some("2026-09-02T12:00:00Z".into()),
+                category: None,
+                dry_run: Some(false),
+            },
+        )
+        .unwrap();
+        assert!(!base.candidates.is_empty());
+        c.execute("INSERT INTO candidate_engine_runs(business_date,timezone,generated_at,model_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,input_fingerprint,status,match_count_considered,prediction_context) SELECT business_date,timezone,'2026-09-02T13:00:00Z',model_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,'empty-base-publication','COMPLETED',0,'BASE' FROM candidate_engine_runs WHERE id=?1",[base.run_id]).unwrap();
+        let empty = c.last_insert_rowid();
+        publish(&c, "2026-09-02", empty, false).unwrap();
+        assert_eq!(
+            selected_run_id(&c, "2026-09-02").unwrap(),
+            Some(base.run_id)
+        );
+    }
     use crate::database::Database;
 
     fn fixture() -> Database {
@@ -53,10 +227,71 @@ mod tests {
         )
         .unwrap();
         c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(1,'2026/27',1,2,'2026-09-02T18:00:00Z','scheduled','2026-09-02',1)", []).unwrap();
-        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status) VALUES(1,'TOTAL_GOALS','OVER',2.5,.80,'MODEL_OUTPUT','2026-09-02T18:00:00Z',1,.80,.80,'UNCALIBRATED_V1')", []).unwrap();
+        c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,created_at) VALUES(1,'TOTAL_GOALS','OVER',2.5,.80,'MODEL_OUTPUT','2026-09-02T18:00:00Z',1,.80,.80,'UNCALIBRATED_V1','2026-09-02T11:00:00Z')", []).unwrap();
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(1,'fe_v1','2026-09-02T09:00:00Z','{}','{\"history_matches_home\":10,\"history_matches_away\":10}','2026-09-02T09:00:00Z')", []).unwrap();
         drop(c);
         db
     }
+    #[test]
+    fn daily_odds_expire_at_exact_24_hour_boundary() {
+        let db = fixture();
+        let c = db.connection().unwrap();
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(1,'iddaa','g','TOTAL_GOALS','OVER',2.0,'TOTAL_GOALS','OVER',2.5,'2026-09-01T11:59:59Z')",[]).unwrap();
+        let request = GenerateRequest {
+            business_date: Some("2026-09-02".into()),
+            generation_time: Some("2026-09-02T12:00:00Z".into()),
+            category: Some("OVER_25".into()),
+            dry_run: Some(false),
+        };
+        let stale = generate(&c, &request).unwrap();
+        assert!(stale.candidates.is_empty());
+        assert!(stale.exclusions.iter().any(|e| e.reason == "STALE_ODDS"));
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(1,'iddaa','g','TOTAL_GOALS','OVER',2.0,'TOTAL_GOALS','OVER',2.5,'2026-09-01T12:00:00Z')",[]).unwrap();
+        assert_eq!(generate(&c, &request).unwrap().candidates.len(), 1);
+    }
+
+    #[test]
+    fn provider_corner_btts_mapping_and_cross_season_history_reach_policy() {
+        let db = fixture();
+        let c = db.connection().unwrap();
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(1,'fe_v1','2026-09-02T10:00:00Z',?1,?2,'2026-09-02T10:00:00Z')", params![r#"{"home":{"overall_last10":{"sample_size":10}},"away":{"overall_last10":{"sample_size":10}}}"#,r#"{"history_matches_home":0,"history_matches_away":0,"corners_coverage":1.0}"#]).unwrap();
+        for (market, selection, line, code, provider_market, raw_selection) in [
+            (
+                "FULL_TIME_TOTAL_CORNERS",
+                "OVER",
+                Some(9.5),
+                "48",
+                "UNKNOWN",
+                "Üst",
+            ),
+            ("BTTS", "YES", None, "btts", "BOTH_TEAMS_TO_SCORE", "YES"),
+        ] {
+            c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,created_at) VALUES(1,?1,?2,?3,.8,'test','2026-09-02T18:00:00Z',1,.8,.8,'UNCALIBRATED_V1','2026-09-02T11:00:00Z')", params![market,selection,line]).unwrap();
+            c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(1,'iddaa',?1,?2,?3,2.0,?2,?4,?5,'2026-09-02T10:00:00Z')", params![code,provider_market,raw_selection,selection,line]).unwrap();
+        }
+        let request = GenerateRequest {
+            business_date: Some("2026-09-02".into()),
+            generation_time: Some("2026-09-02T12:00:00Z".into()),
+            category: None,
+            dry_run: Some(false),
+        };
+        let run = generate(&c, &request).unwrap();
+        for category in ["CORNERS", "BTTS_YES"] {
+            assert_eq!(
+                run.candidates
+                    .iter()
+                    .filter(|x| x.category == category)
+                    .count(),
+                1
+            );
+        }
+        // A provider's non-bettable 1.00 price must never enter any pool.
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) VALUES(1,'iddaa','48','UNKNOWN','Üst',1.0,'UNKNOWN','OVER',9.5,'2026-09-02T11:30:00Z')",[]).unwrap();
+        let rerun = generate(&c, &request).unwrap();
+        assert!(!rerun.candidates.iter().any(|x| x.category == "CORNERS"));
+        assert!(c.query_row::<i64,_,_>("SELECT count(*) FROM candidate_engine_exclusions WHERE run_id=?1 AND category='CORNERS' AND reason='INVALID_ODDS'",[rerun.run_id],|r|r.get(0)).unwrap()>0);
+    }
+
     #[test]
     fn policy_timezone_and_value_contract_are_deterministic() {
         assert_eq!(policy().version, POLICY_VERSION);
@@ -111,9 +346,10 @@ impl Default for CandidatePolicy {
             version: POLICY_VERSION.into(),
             high_confidence_min_public_probability: 0.75,
             high_confidence_min_bucket_sample: 20,
-            over_25_min_public_probability: 0.64,
+            // Daily goal pools are ranked, not threshold-selected.
+            over_25_min_public_probability: 0.0,
             over_35_min_public_probability: 0.52,
-            btts_yes_min_public_probability: 0.64,
+            btts_yes_min_public_probability: 0.0,
             surprise_min_odd: 2.0,
             surprise_min_public_probability: 0.42,
             surprise_min_edge: 0.05,
@@ -314,6 +550,8 @@ struct P {
     generated: String,
     match_status: String,
     quality_json: String,
+    goal_identity_valid: bool,
+    kickoff_known: bool,
 }
 #[derive(Clone)]
 struct O {
@@ -336,8 +574,11 @@ fn sha(s: &str) -> String {
     format!("{:x}", h.finalize())
 }
 fn load(c: &Connection, date: &str, cutoff: &str) -> Result<Vec<P>, String> {
-    let mut q=c.prepare("SELECT p.id,p.match_id,m.competition_id,p.market,p.selection,p.line_value,COALESCE(p.raw_probability,p.model_probability),COALESCE(p.public_probability,p.model_probability),COALESCE(p.calibration_status,'UNCALIBRATED_V1'),p.calibration_version,p.calibration_bucket,p.bucket_observed_rate,p.bucket_sample_size,p.bucket_calibration_gap,COALESCE(p.availability,'AVAILABLE'),COALESCE(pr.generated_at,?2),m.status,COALESCE(fs.data_quality_json,'{}') FROM predictions p JOIN matches m ON m.id=p.match_id LEFT JOIN prediction_runs pr ON pr.id=p.prediction_run_id LEFT JOIN feature_sets fs ON fs.match_id=p.match_id WHERE m.scheduled_local_date=?1 AND (pr.generated_at IS NULL OR pr.generated_at<=?2) ORDER BY m.kickoff_at,m.id,p.market,p.selection,p.line_value,p.id").map_err(|e|e.to_string())?;
-    let v = q
+    // prediction_runs.generated_at is the immutable feature-information cutoff
+    // (normally kickoff), while predictions.created_at is the actual inference
+    // time. Candidate as-of filtering and odds freshness must use the latter.
+    let mut q=c.prepare("SELECT p.id,p.match_id,m.competition_id,p.market,p.selection,p.line_value,COALESCE(p.raw_probability,p.model_probability),COALESCE(p.public_probability,p.model_probability),COALESCE(p.calibration_status,'UNCALIBRATED_V1'),p.calibration_version,p.calibration_bucket,p.bucket_observed_rate,p.bucket_sample_size,p.bucket_calibration_gap,COALESCE(p.availability,'AVAILABLE'),p.created_at,CASE WHEN m.status IN ('scheduled','finished','live') THEN CASE WHEN julianday(m.kickoff_at)<=julianday(?2) THEN 'started' ELSE 'scheduled' END ELSE m.status END,CASE WHEN json_extract(fs.feature_json,'$.home.overall_last10.sample_size') IS NOT NULL THEN json_set(COALESCE(fs.data_quality_json,'{}'),'$.history_matches_home',json_extract(fs.feature_json,'$.home.overall_last10.sample_size'),'$.history_matches_away',json_extract(fs.feature_json,'$.away.overall_last10.sample_size')) ELSE COALESCE(fs.data_quality_json,'{}') END FROM predictions p JOIN matches m ON m.id=p.match_id LEFT JOIN feature_sets fs ON fs.id=(SELECT f.id FROM feature_sets f WHERE f.match_id=p.match_id AND julianday(f.calculated_at)<=julianday(?2) ORDER BY julianday(f.calculated_at) DESC,f.id DESC LIMIT 1) WHERE m.scheduled_local_date=?1 AND julianday(p.created_at)<=julianday(?2) AND p.model_version_id=(SELECT id FROM model_versions WHERE is_active=1) AND NOT EXISTS(SELECT 1 FROM predictions newer WHERE newer.match_id=p.match_id AND newer.market=p.market AND newer.selection=p.selection AND newer.line_value IS p.line_value AND newer.model_version_id=p.model_version_id AND julianday(newer.created_at)<=julianday(?2) AND (julianday(newer.created_at)>julianday(p.created_at) OR (julianday(newer.created_at)=julianday(p.created_at) AND newer.id>p.id))) ORDER BY m.kickoff_at,m.id,p.market,p.selection,p.line_value,p.id").map_err(|e|e.to_string())?;
+    let mut v = q
         .query_map(params![date, cutoff], |r| {
             Ok(P {
                 id: r.get(0)?,
@@ -355,18 +596,34 @@ fn load(c: &Connection, date: &str, cutoff: &str) -> Result<Vec<P>, String> {
                 n: r.get::<_, Option<i64>>(12)?.map(|x| x as usize),
                 gap: r.get(13)?,
                 availability: r.get(14)?,
-                generated: r.get(15)?,
+                generated: cutoff.to_string(),
                 match_status: r.get(16)?,
                 quality_json: r.get(17)?,
+                goal_identity_valid: true,
+                kickoff_known: true,
             })
         })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    let mut identity = BTreeMap::new();
+    for p in &mut v {
+        let (resolved, known) = if let Some(value) = identity.get(&p.match_id) {
+            *value
+        } else {
+            // Existing canonical predictions are sufficient for non-bulletin
+            // fixtures. Iddaa fixtures must also retain their model mappings.
+            let value: (bool, bool) = c.query_row("SELECT NOT EXISTS(SELECT 1 FROM provider_match_mappings pm WHERE pm.match_id=m.id AND pm.provider='iddaa') OR (EXISTS(SELECT 1 FROM provider_competition_mappings pc WHERE pc.competition_id=m.competition_id AND pc.provider='football-data.co.uk') AND EXISTS(SELECT 1 FROM provider_team_mappings pt WHERE pt.team_id=m.home_team_id AND pt.provider='football-data.co.uk') AND EXISTS(SELECT 1 FROM provider_team_mappings pt WHERE pt.team_id=m.away_team_id AND pt.provider='football-data.co.uk')), m.kickoff_time_known FROM matches m WHERE m.id=?1", [p.match_id], |r| Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+            identity.insert(p.match_id, value);
+            value
+        };
+        p.goal_identity_valid = resolved;
+        p.kickoff_known = known;
+    }
     Ok(v)
 }
 fn odd(c: &Connection, p: &P, cutoff: &str) -> Result<Option<O>, String> {
-    c.query_row("SELECT id,odd,captured_at FROM odds_snapshots WHERE match_id=?1 AND captured_at<=?2 AND UPPER(COALESCE(normalized_market_type,market_name))=UPPER(?3) AND UPPER(COALESCE(normalized_selection,selection))=UPPER(?4) AND (line_value IS ?5 OR line_value=?5) ORDER BY captured_at DESC,id DESC LIMIT 1",params![p.match_id,cutoff,p.market,p.selection,p.line],|r|Ok(O{id:r.get(0)?,odd:r.get(1)?,captured:r.get(2)?})).optional().map_err(|e|e.to_string())
+    c.query_row("SELECT id,odd,captured_at FROM iddaa_model_odds WHERE provider='iddaa' AND match_id=?1 AND julianday(captured_at)<=julianday(?2) AND UPPER(model_market_type) IN (UPPER(?3),CASE ?3 WHEN 'BTTS' THEN 'BOTH_TEAMS_TO_SCORE' WHEN 'FULL_TIME_TOTAL_CORNERS' THEN 'CORNERS_TOTAL' ELSE UPPER(?3) END) AND UPPER(model_selection)=UPPER(?4) AND (line_value IS ?5 OR line_value=?5) ORDER BY julianday(captured_at) DESC,id DESC LIMIT 1",params![p.match_id,cutoff,p.market,p.selection,p.line],|r|Ok(O{id:r.get(0)?,odd:r.get(1)?,captured:r.get(2)?})).optional().map_err(|e|e.to_string())
 }
 fn good(p: &P) -> bool {
     let v: serde_json::Value = serde_json::from_str(&p.quality_json).unwrap_or_default();
@@ -400,8 +657,39 @@ fn corr(p: &P) -> &'static str {
     }
 }
 fn reject(p: &P, cat: &str, o: &O, pol: &CandidatePolicy) -> Option<String> {
+    if !o.odd.is_finite() || o.odd <= 1.0 {
+        return Some("INVALID_ODDS".into());
+    }
     if p.availability != "AVAILABLE" {
         return Some("MODEL_UNAVAILABLE".into());
+    }
+    if daily_goal_category(cat) {
+        if !p.goal_identity_valid {
+            return Some("RESOLUTION_FAILED".into());
+        }
+        if !p.kickoff_known {
+            return Some("KICKOFF_UNKNOWN".into());
+        }
+        if !p.public.is_finite() || !(0.0..=1.0).contains(&p.public) {
+            return Some("INVALID_PROBABILITY".into());
+        }
+        if !good(p) {
+            return Some("INSUFFICIENT_HISTORY".into());
+        }
+        // Uncalibrated / small-sample models are uncertain, not proven bad.
+        // Reject explicit failures or severe, well-supported overconfidence.
+        if matches!(p.status.as_str(), "INVALID" | "MODEL_INVALID" | "REJECTED")
+            || p.observed.is_some_and(|observed| {
+                observed.is_finite()
+                    && (0.0..=1.0).contains(&observed)
+                    && p.n.unwrap_or(0) >= 50
+                    && p.public - observed > 0.20
+                    && p.public - observed
+                        > 3.0 * (p.public * (1.0 - p.public) / p.n.unwrap() as f64).sqrt()
+            })
+        {
+            return Some("NEGATIVE_MODEL_QUALITY".into());
+        }
     }
     if p.match_status != "scheduled" {
         return Some(if p.match_status == "finished" {
@@ -415,10 +703,13 @@ fn reject(p: &P, cat: &str, o: &O, pol: &CandidatePolicy) -> Option<String> {
     }
     let age = ts(&p.generated)
         .ok()
-        .and_then(|a| ts(&o.captured).ok().map(|b| (a - b).num_hours()))
+        .and_then(|a| ts(&o.captured).ok().map(|b| (a - b).num_seconds()))
         .unwrap_or(i64::MAX);
-    if age > MAX_DAILY_ODDS_AGE_HOURS {
+    if age > MAX_DAILY_ODDS_AGE_HOURS * 3600 {
         return Some("STALE_ODDS".into());
+    }
+    if daily_goal_category(cat) && age < 0 {
+        return Some("INVALID_ODDS".into());
     }
     let edge = p.public - 1.0 / o.odd;
     match cat {
@@ -437,10 +728,6 @@ fn reject(p: &P, cat: &str, o: &O, pol: &CandidatePolicy) -> Option<String> {
         "OVER_25" => {
             if p.market != "TOTAL_GOALS" || p.selection != "OVER" || p.line != Some(2.5) {
                 Some("UNSUPPORTED_MARKET".into())
-            } else if p.public < pol.over_25_min_public_probability {
-                Some("LOW_PUBLIC_PROBABILITY".into())
-            } else if edge <= 0.0 {
-                Some("LOW_EDGE".into())
             } else {
                 None
             }
@@ -459,10 +746,6 @@ fn reject(p: &P, cat: &str, o: &O, pol: &CandidatePolicy) -> Option<String> {
         "BTTS_YES" => {
             if p.market != "BTTS" || p.selection != "YES" {
                 Some("UNSUPPORTED_MARKET".into())
-            } else if p.public < pol.btts_yes_min_public_probability {
-                Some("LOW_PUBLIC_PROBABILITY".into())
-            } else if edge <= 0.0 {
-                Some("LOW_EDGE".into())
             } else {
                 None
             }
@@ -491,13 +774,14 @@ fn reject(p: &P, cat: &str, o: &O, pol: &CandidatePolicy) -> Option<String> {
             }
         }
         "COMPOUND" => {
-            if p.public < pol.compound_min_public_probability
-                || o.odd < pol.compound_odd_range[0]
-                || o.odd > pol.compound_odd_range[1]
-            {
+            if p.public < pol.compound_min_public_probability {
                 Some("LOW_PUBLIC_PROBABILITY".into())
-            } else if p.status != "CALIBRATED_V1"
-                || p.n.unwrap_or(0) < pol.compound_min_bucket_sample
+            } else if o.odd < pol.compound_odd_range[0] || o.odd > pol.compound_odd_range[1] {
+                Some("ODDS_OUTSIDE_COMPOUND_RANGE".into())
+            } else if !matches!(
+                p.status.as_str(),
+                "CALIBRATED_V1" | "CALIBRATION_NOT_BENEFICIAL"
+            ) || p.n.unwrap_or(0) < pol.compound_min_bucket_sample
             {
                 Some("CALIBRATION_INSUFFICIENT".into())
             } else {
@@ -507,6 +791,34 @@ fn reject(p: &P, cat: &str, o: &O, pol: &CandidatePolicy) -> Option<String> {
         _ => Some("UNSUPPORTED_MARKET".into()),
     }
 }
+fn daily_goal_category(category: &str) -> bool {
+    matches!(category, "OVER_25" | "BTTS_YES")
+}
+
+/// Keep daily probability primary; EV, confidence and history break ties.
+/// Other pools retain their existing weighted-score order.
+pub(crate) fn compare_candidates(a: &Candidate, b: &Candidate) -> std::cmp::Ordering {
+    a.category
+        .cmp(&b.category)
+        .then_with(|| {
+            if daily_goal_category(&a.category) {
+                let component =
+                    |x: &Candidate, key: &str| x.score_components.get(key).copied().unwrap_or(0.0);
+                b.public_probability
+                    .total_cmp(&a.public_probability)
+                    .then_with(|| b.expected_value.total_cmp(&a.expected_value))
+                    .then_with(|| component(b, "confidence").total_cmp(&component(a, "confidence")))
+                    .then_with(|| {
+                        component(b, "history_quality").total_cmp(&component(a, "history_quality"))
+                    })
+            } else {
+                b.score.total_cmp(&a.score)
+            }
+        })
+        .then_with(|| a.match_id.cmp(&b.match_id))
+        .then_with(|| a.prediction_id.cmp(&b.prediction_id))
+}
+
 fn make(p: &P, o: &O, cat: &str) -> Candidate {
     let implied = 1.0 / o.odd;
     let edge = p.public - implied;
@@ -517,17 +829,48 @@ fn make(p: &P, o: &O, cat: &str) -> Candidate {
     } else {
         0.0
     };
-    let score = 0.55 * p.public
-        + 0.25 * edge.clamp(0.0, 1.0)
-        + 0.15 * ev.clamp(0.0, 1.0)
-        + 0.04 * cs
-        + 0.01 * dq;
+    let score = if daily_goal_category(cat) {
+        p.public
+    } else {
+        0.55 * p.public
+            + 0.25 * edge.clamp(0.0, 1.0)
+            + 0.15 * ev.clamp(0.0, 1.0)
+            + 0.04 * cs
+            + 0.01 * dq
+    };
     let mut comp = BTreeMap::new();
     comp.insert("public_probability".into(), p.public);
     comp.insert("edge".into(), edge);
     comp.insert("expected_value".into(), ev);
     comp.insert("calibration_support".into(), p.n.unwrap_or(0) as f64);
     comp.insert("data_quality".into(), dq);
+    if daily_goal_category(cat) {
+        let n = p.n.unwrap_or(0) as f64;
+        let gap = p
+            .gap
+            .filter(|v| v.is_finite())
+            .map(f64::abs)
+            .or_else(|| {
+                p.observed
+                    .filter(|v| v.is_finite())
+                    .map(|v| (p.public - v).abs())
+            })
+            .unwrap_or(0.0);
+        let quality: serde_json::Value = serde_json::from_str(&p.quality_json).unwrap_or_default();
+        let history = ["history_matches_home", "history_matches_away"]
+            .iter()
+            .map(|key| quality.get(*key).and_then(|v| v.as_u64()).unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        comp.insert(
+            "confidence".into(),
+            n / (n + 20.0) * (1.0 - gap).clamp(0.0, 1.0),
+        );
+        comp.insert(
+            "history_quality".into(),
+            (history as f64 / 10.0).clamp(0.0, 1.0),
+        );
+    }
     Candidate {
         id: 0,
         prediction_id: p.id,
@@ -606,6 +949,11 @@ fn state_fingerprint(c: &Connection, ps: &[P], cutoff: &str) -> Result<String, S
             p.public.to_bits(),
             p.status
         ));
+        state.push_str(&format!("{}|{};", p.match_status, p.quality_json));
+        state.push_str(&format!(
+            "{}|{}|{:?}|{:?}|{:?};",
+            p.goal_identity_valid, p.kickoff_known, p.observed, p.n, p.gap
+        ));
         if let Some(o) = odd(c, p, cutoff)? {
             state.push_str(&format!("o:{}|{}|{};", o.id, o.odd.to_bits(), o.captured));
         }
@@ -613,7 +961,7 @@ fn state_fingerprint(c: &Connection, ps: &[P], cutoff: &str) -> Result<String, S
     Ok(sha(&state))
 }
 
-fn insert_candidate(c: &Connection, run_id: i64, x: &Candidate) -> Result<(), String> {
+pub(crate) fn insert_candidate(c: &Connection, run_id: i64, x: &Candidate) -> Result<(), String> {
     c.execute("INSERT INTO candidate_engine_candidates(run_id,prediction_id,match_id,competition_id,category,market,selection,line_value,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_observed_rate,bucket_sample_size,bucket_calibration_gap,iddaa_odd,odds_snapshot_id,odds_captured_at,implied_probability,probability_edge,expected_value,data_quality,score,score_components_json,rank,same_match_group,correlation_type,compound_eligible,qualification_state,prediction_source,lineup_revision_id,lineup_snapshot_id,base_public_probability,final_public_probability,delta_percentage_points,lineup_family_status,lineup_fallback_reason,lineup_model_version,lineup_model_hash)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,?35,?36,?37,?38,?39,?40)", params![run_id,x.prediction_id,x.match_id,x.competition_id,x.category,x.market,x.selection,x.line,x.raw_probability,x.public_probability,x.calibration_status,x.calibration_version,x.calibration_bucket,x.bucket_observed_rate,x.bucket_sample_size.map(|n| n as i64),x.bucket_calibration_gap,x.iddaa_odd,x.odds_snapshot_id,x.odds_captured_at,x.implied_probability,x.probability_edge,x.expected_value,x.data_quality,x.score,serde_json::to_string(&x.score_components).map_err(|e| e.to_string())?,x.rank,x.same_match_group,x.correlation_type,x.compound_eligible as i64,x.qualification_state,x.prediction_source,x.lineup_revision_id,x.lineup_snapshot_id,x.base_public_probability,x.final_public_probability,x.delta_percentage_points,x.lineup_family_status,x.lineup_fallback_reason,x.lineup_model_version,x.lineup_model_hash]).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -785,17 +1133,14 @@ pub fn generate_lineup_revision(
             }
         }
     }
+    // Keep the strongest qualified selection per match/category, not whichever
+    // market happened to be loaded first from SQLite.
+    cs.sort_by(compare_candidates);
     for cat in CATEGORIES {
         let mut seen = BTreeMap::new();
         cs.retain(|x| x.category != cat || seen.insert(x.match_id, true).is_none());
     }
-    cs.sort_by(|a, b| {
-        a.category
-            .cmp(&b.category)
-            .then_with(|| b.score.partial_cmp(&a.score).unwrap())
-            .then_with(|| a.match_id.cmp(&b.match_id))
-            .then_with(|| a.prediction_id.cmp(&b.prediction_id))
-    });
+    cs.sort_by(compare_candidates);
     let mut ranks = BTreeMap::new();
     for x in &mut cs {
         *ranks.entry(x.category.clone()).or_insert(0) += 1;
@@ -854,16 +1199,70 @@ pub fn generate_lineup_revision(
     Ok(out)
 }
 
+/// Commit candidates, their coupons and the visible publication together.
+pub fn generate_daily_output(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String> {
+    if r.dry_run.unwrap_or(false) {
+        return generate(c, r);
+    }
+    // Reserve the writer before reading the publication/input snapshot. The
+    // independent logo worker must not invalidate a deferred read transaction.
+    let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let run = generate(&tx, r)?;
+    super::coupon_engine::generate_daily(
+        &tx,
+        &super::coupon_engine::GenerateRequest {
+            business_date: run.business_date.clone(),
+            candidate_run_id: Some(run.run_id),
+            coupon_type: None,
+            unit_stake_cents: None,
+        },
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(run)
+}
+
 pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String> {
+    // A category is a view of a complete run, never a partially persisted run.
+    if r.category.is_some() {
+        let mut full = r.clone();
+        full.category = None;
+        let mut result = generate(c, &full)?;
+        result
+            .candidates
+            .retain(|x| Some(&x.category) == r.category.as_ref());
+        result
+            .exclusions
+            .retain(|x| Some(&x.category) == r.category.as_ref());
+        result
+            .category_summaries
+            .retain(|x| Some(&x.category) == r.category.as_ref());
+        return Ok(result);
+    }
     let generated = r.generation_time.clone().unwrap_or_else(now);
     let date = r.business_date.clone().unwrap_or(day(&generated)?);
+    if r.generation_time.is_none() && date < day(&generated)? {
+        // Past-date navigation/re-generation reopens its immutable publication.
+        // A new replay requires an explicit information cutoff.
+        return get(
+            c,
+            &GetRequest {
+                business_date: date,
+                run_id: None,
+                category: None,
+            },
+        )
+        .map_err(|_| "HISTORICAL_REPLAY_REQUIRES_AS_OF".into());
+    }
+    chrono::NaiveDate::parse_from_str(&date, "%Y-%m-%d").map_err(|_| "INVALID_BUSINESS_DATE")?;
+    let generated = ts(&generated)?.with_timezone(&Utc).to_rfc3339();
     let pol = policy();
     let (model,cal):(String,Option<String>)=c.query_row("SELECT version_identifier,(SELECT calibration_version FROM calibration_models WHERE is_active=1) FROM model_versions WHERE is_active=1",[],|x|Ok((x.get(0)?,x.get(1)?))).optional().map_err(|e|e.to_string())?.ok_or("no active model")?;
     let cfg = serde_json::to_string(&pol).map_err(|e| e.to_string())?;
     let ps = load(c, &date, &generated)?;
     let input_state = state_fingerprint(c, &ps, &generated)?;
     let fp = sha(&format!(
-        "{date}|{generated}|{model}|{:?}|{cfg}|{input_state}",
+        "daily-v7|{date}|{generated}|{model}|{:?}|{cfg}|{input_state}",
         cal
     ));
     if let Some(id) = c
@@ -875,6 +1274,9 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
         .optional()
         .map_err(|e| e.to_string())?
     {
+        if !r.dry_run.unwrap_or(false) {
+            publish(c, &date, id, r.generation_time.is_some())?;
+        }
         return get(
             c,
             &GetRequest {
@@ -886,12 +1288,52 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
     }
     let mut cs = Vec::new();
     let mut ex = Vec::new();
+    // Explain bulletin matches that cannot reach inference, instead of silently
+    // omitting them from the daily screen and its considered-match count.
+    let mut considered: std::collections::BTreeSet<i64> = ps.iter().map(|p| p.match_id).collect();
+    let mut scope = c.prepare("SELECT m.id,m.competition_id FROM matches m WHERE m.scheduled_local_date=?1 AND EXISTS(SELECT 1 FROM provider_match_mappings pm WHERE pm.match_id=m.id AND pm.provider='iddaa')").map_err(|e|e.to_string())?;
+    let bulletin = scope
+        .query_map([&date], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    for (id, competition_id) in bulletin {
+        if !considered.insert(id) {
+            continue;
+        }
+        let coverage = super::model_coverage::classify(c, id).map_err(|e| e.to_string())?;
+        let reason = match coverage {
+            super::model_coverage::CoverageState::ModelUnsupported => "MODEL_UNSUPPORTED",
+            super::model_coverage::CoverageState::ResolutionFailed => "RESOLUTION_FAILED",
+            super::model_coverage::CoverageState::ModelInputMissing => "INSUFFICIENT_HISTORY",
+            _ => "MODEL_PREDICTION_UNAVAILABLE",
+        };
+        for cat in CATEGORIES
+            .iter()
+            .filter(|cat| r.category.as_deref().is_none_or(|x| x == **cat))
+        {
+            ex.push(Exclusion {
+                prediction_id: None,
+                match_id: Some(id),
+                business_date: date.clone(),
+                competition_id: Some(competition_id),
+                category: (*cat).into(),
+                market: None,
+                selection: None,
+                line: None,
+                reason: reason.into(),
+                generated_at: generated.clone(),
+                details: None,
+            });
+        }
+    }
     for p in &ps {
+        let odds = odd(c, p, &generated)?;
         for cat in CATEGORIES {
             if r.category.as_deref().is_some_and(|x| x != cat) {
                 continue;
             }
-            match odd(c, p, &generated)? {
+            match &odds {
                 None => ex.push(exclusion(p, &date, cat, "ODDS_UNAVAILABLE", &generated)),
                 Some(o) => {
                     if let Some(reason) = reject(p, cat, &o, &pol) {
@@ -903,6 +1345,7 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
             }
         }
     }
+    cs.sort_by(compare_candidates);
     for cat in CATEGORIES {
         let mut seen = BTreeMap::new();
         cs.retain(|x| {
@@ -928,13 +1371,7 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
             }
         });
     }
-    cs.sort_by(|a, b| {
-        a.category
-            .cmp(&b.category)
-            .then_with(|| b.score.partial_cmp(&a.score).unwrap())
-            .then_with(|| a.match_id.cmp(&b.match_id))
-            .then_with(|| a.prediction_id.cmp(&b.prediction_id))
-    });
+    cs.sort_by(compare_candidates);
     let mut ranks: BTreeMap<String, i64> = BTreeMap::new();
     for x in &mut cs {
         let n = ranks.entry(x.category.clone()).or_insert(0);
@@ -944,7 +1381,7 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
     let run_id = if r.dry_run.unwrap_or(false) {
         0
     } else {
-        c.execute("INSERT INTO candidate_engine_runs(business_date,timezone,generated_at,model_version,calibration_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,input_fingerprint,status,match_count_considered,prediction_context)VALUES(?1,?2,?3,?4,?5,?6,'fe_v1',?3,?7,?8,'COMPLETED',?9,'BASE')",params![date,BUSINESS_TIMEZONE,generated,model,cal,pol.version,sha(&cfg),fp,ps.iter().map(|p|p.match_id).collect::<std::collections::BTreeSet<_>>().len()]).map_err(|e|e.to_string())?;
+        c.execute("INSERT INTO candidate_engine_runs(business_date,timezone,generated_at,model_version,calibration_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,input_fingerprint,status,match_count_considered,prediction_context)VALUES(?1,?2,?3,?4,?5,?6,'fe_v1',?3,?7,?8,'COMPLETED',?9,'BASE')",params![date,BUSINESS_TIMEZONE,generated,model,cal,pol.version,sha(&cfg),fp,considered.len()]).map_err(|e|e.to_string())?;
         let id = c.last_insert_rowid();
         for x in &cs {
             insert_candidate(c, id, x)?;
@@ -952,8 +1389,31 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
         for x in &ex {
             c.execute("INSERT INTO candidate_engine_exclusions(run_id,prediction_id,match_id,business_date,competition_id,category,market,selection,line_value,reason,details_json,generated_at)VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![id,x.prediction_id,x.match_id,x.business_date,x.competition_id,x.category,x.market,x.selection,x.line,x.reason,x.details.as_ref().map(|v|v.to_string()),x.generated_at]).map_err(|e|e.to_string())?;
         }
+        c.execute(
+            "INSERT INTO candidate_run_execution(run_id,purpose) VALUES(?1,?2)",
+            params![
+                id,
+                if r.generation_time.is_some() {
+                    "REPLAY"
+                } else {
+                    "LIVE"
+                }
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        publish(c, &date, id, r.generation_time.is_some())?;
         id
     };
+    if run_id > 0 {
+        return get(
+            c,
+            &GetRequest {
+                business_date: date,
+                run_id: Some(run_id),
+                category: r.category.clone(),
+            },
+        );
+    }
     let sums = CATEGORIES
         .iter()
         .filter(|cat| r.category.as_deref().is_none_or(|x| x == **cat))
@@ -977,11 +1437,7 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
         model_version: model,
         calibration_version: cal,
         policy_version: pol.version,
-        match_count_considered: ps
-            .iter()
-            .map(|p| p.match_id)
-            .collect::<std::collections::BTreeSet<_>>()
-            .len(),
+        match_count_considered: considered.len(),
         category_summaries: sums,
         candidates: cs,
         exclusions: ex,
@@ -1001,9 +1457,58 @@ pub fn generate(c: &Connection, r: &GenerateRequest) -> Result<DailyRun, String>
     })
 }
 
+pub fn selected_run_id(c: &Connection, date: &str) -> Result<Option<i64>, String> {
+    let selected: Option<i64> = c
+        .query_row(
+            "SELECT candidate_run_id FROM daily_output_publications WHERE business_date=?1",
+            [date],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some(id) = selected else { return Ok(None) };
+    let header: Option<(String, bool)> = c.query_row("SELECT COALESCE(prediction_context,'BASE'),EXISTS(SELECT 1 FROM candidate_engine_candidates WHERE run_id=r.id AND qualification_state='QUALIFIED') FROM candidate_engine_runs r WHERE id=?1 AND business_date=?2 AND status='COMPLETED'", params![id,date], |r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
+    let Some((context, populated)) = header else {
+        return Ok(None);
+    };
+    if populated && (context == "BASE" || valid_lineup_run(c, id)?) {
+        return Ok(Some(id));
+    }
+    // Recover only full BASE output; category-only and un-published replay runs
+    // must not become the daily publication just because their ID is newer.
+    let base: Option<i64> = c.query_row("SELECT r.id FROM candidate_engine_runs r WHERE r.business_date=?1 AND COALESCE(r.prediction_context,'BASE')='BASE' AND r.status='COMPLETED' AND EXISTS(SELECT 1 FROM candidate_engine_candidates x WHERE x.run_id=r.id AND x.qualification_state='QUALIFIED') AND (r.id=(SELECT parent_candidate_run_id FROM candidate_engine_runs WHERE id=?2) OR EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=r.id AND e.purpose='LIVE')) ORDER BY (r.id=(SELECT parent_candidate_run_id FROM candidate_engine_runs WHERE id=?2)) DESC,julianday(r.generated_at) DESC,r.id DESC LIMIT 1",params![date,id],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+    Ok(base.or(if context == "BASE" { Some(id) } else { None }))
+}
+
+pub(crate) fn valid_lineup_run(c: &Connection, id: i64) -> Result<bool, String> {
+    c.query_row("SELECT EXISTS(SELECT 1 FROM candidate_engine_candidates x JOIN candidate_engine_runs r ON r.id=x.run_id JOIN prediction_revisions pr ON pr.id=x.lineup_revision_id AND pr.match_id=x.match_id JOIN lineup_snapshots ls ON ls.id=pr.lineup_snapshot_id AND ls.id=x.lineup_snapshot_id AND ls.match_id=x.match_id WHERE r.id=?1 AND r.prediction_context='LINEUP_AWARE' AND r.status='COMPLETED' AND x.prediction_source='LINEUP_AWARE' AND x.qualification_state='QUALIFIED' AND pr.revision_type='LINEUP_AWARE_PREMATCH' AND pr.revision_status='REVISION_AVAILABLE' AND pr.payload_schema=?2 AND pr.lineup_model_hash IS NOT NULL AND ls.is_official=1 AND ls.lineup_status='OFFICIAL' AND ls.completeness_status='COMPLETE_OFFICIAL')",params![id,super::lineup_model::REVISION_PAYLOAD_SCHEMA],|r|r.get(0)).map_err(|e|e.to_string())
+}
+
+fn publish(c: &Connection, date: &str, id: i64, replay: bool) -> Result<(), String> {
+    let (context, populated): (String,bool) = c.query_row("SELECT COALESCE(prediction_context,'BASE'),EXISTS(SELECT 1 FROM candidate_engine_candidates x WHERE x.run_id=r.id AND x.qualification_state='QUALIFIED') FROM candidate_engine_runs r WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+    if context == "LINEUP_AWARE" && !valid_lineup_run(c, id)? {
+        return Ok(());
+    }
+    if !populated && selected_run_id(c, date)?.is_some() {
+        return Ok(());
+    }
+    if replay {
+        c.execute("INSERT OR IGNORE INTO daily_output_publications(business_date,candidate_run_id) VALUES(?1,?2)", params![date,id]).map_err(|e|e.to_string())?;
+    } else {
+        c.execute("INSERT INTO daily_output_publications(business_date,candidate_run_id) VALUES(?1,?2) ON CONFLICT(business_date) DO UPDATE SET candidate_run_id=excluded.candidate_run_id,published_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE julianday((SELECT generated_at FROM candidate_engine_runs WHERE id=excluded.candidate_run_id))>=julianday((SELECT generated_at FROM candidate_engine_runs WHERE id=daily_output_publications.candidate_run_id))", params![date,id]).map_err(|e|e.to_string())?;
+    }
+    Ok(())
+}
+
 pub fn get(c: &Connection, r: &GetRequest) -> Result<DailyRun, String> {
-    let id=r.run_id.or(c.query_row("SELECT id FROM candidate_engine_runs WHERE business_date=?1 ORDER BY generated_at DESC,id DESC LIMIT 1",[&r.business_date],|x|x.get(0)).optional().map_err(|e|e.to_string())?).ok_or("no candidate run")?;
+    let id = match r.run_id {
+        Some(id) => id,
+        None => selected_run_id(c, &r.business_date)?.ok_or("no candidate run")?,
+    };
     let h:(String,String,String,String,Option<String>,String,usize)=c.query_row("SELECT business_date,timezone,generated_at,model_version,calibration_version,candidate_policy_version,match_count_considered FROM candidate_engine_runs WHERE id=?1",[id],|x|Ok((x.get(0)?,x.get(1)?,x.get(2)?,x.get(3)?,x.get(4)?,x.get(5)?,x.get::<_,i64>(6)? as usize))).map_err(|e|e.to_string())?;
+    if h.0 != r.business_date {
+        return Err("SOURCE_RUN_DATE_MISMATCH".into());
+    }
     let lineage:(Option<String>,Option<i64>,Option<String>,Option<String>,Option<String>,Option<String>,Option<String>)=c.query_row("SELECT prediction_context,parent_candidate_run_id,lineup_model_version,lineup_model_hash,revision_context_hash,base_model_hash,base_calibration_hash FROM candidate_engine_runs WHERE id=?1",[id],|x|Ok((x.get(0)?,x.get(1)?,x.get(2)?,x.get(3)?,x.get(4)?,x.get(5)?,x.get(6)?))).map_err(|e|e.to_string())?;
     let mut q=c.prepare("SELECT id,prediction_id,match_id,competition_id,category,market,selection,line_value,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_observed_rate,bucket_sample_size,bucket_calibration_gap,iddaa_odd,odds_snapshot_id,odds_captured_at,implied_probability,probability_edge,expected_value,data_quality,score,score_components_json,rank,same_match_group,correlation_type,compound_eligible,qualification_state,prediction_source,lineup_revision_id,lineup_snapshot_id,base_public_probability,final_public_probability,delta_percentage_points,lineup_family_status,lineup_fallback_reason,lineup_model_version,lineup_model_hash FROM candidate_engine_candidates WHERE run_id=?1 AND (?2 IS NULL OR category=?2) ORDER BY category,rank").map_err(|e|e.to_string())?;
     let candidates = q
@@ -1166,7 +1671,7 @@ pub fn status(c: &Connection) -> Result<Status, String> {
         .map_err(|e| e.to_string())?;
     let latest = c
         .query_row(
-            "SELECT id FROM candidate_engine_runs ORDER BY generated_at DESC,id DESC LIMIT 1",
+            "SELECT id FROM candidate_engine_runs ORDER BY id DESC LIMIT 1",
             [],
             |x| x.get(0),
         )

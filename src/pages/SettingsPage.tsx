@@ -1,3 +1,4 @@
+import { AutomaticRefresh } from "../components/AutomaticRefresh";
 import { useState } from "react";
 import { PageHeader, Section } from "../components/Page";
 import { UpdateSection } from "../components/UpdateSection";
@@ -9,7 +10,6 @@ export function SettingsPage({ license, onLicense }: { license: LicenseStatus; o
   const [compact, setCompact] = useState(localStorage.getItem("arz.compact") !== "false");
   const [defaultTab, setDefaultTab] = useState(localStorage.getItem("arz.defaultTab") || "today");
   const [startupCheck, setStartupCheck] = useState(localStorage.getItem("arz.startupCheck") !== "false");
-  const [background, setBackground] = useState(localStorage.getItem("arz.backgroundRefresh") !== "false");
   const [key, setKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -39,7 +39,7 @@ export function SettingsPage({ license, onLicense }: { license: LicenseStatus; o
 
   const days = remainingDays(license.expires_at);
   return <>
-    <PageHeader eyebrow="YEREL TERCİHLER" title="Ayarlar" description="Görünüm, başlangıç ve lisans tercihleri bu cihazda tutulur." />
+    <AutomaticRefresh settings/><PageHeader eyebrow="YEREL TERCİHLER" title="Ayarlar" description="Görünüm, başlangıç ve lisans tercihleri bu cihazda tutulur." />
     <div className="settings-grid">
       <Section title="Lisans">
         <div className="license-summary">
@@ -82,7 +82,6 @@ export function SettingsPage({ license, onLicense }: { license: LicenseStatus; o
           </select>
         </label>
         <Toggle label="Başlangıç hazırlık kontrolü" note="Uygulama açıldığında yerel hazırlık durumunu kontrol eder." checked={startupCheck} onChange={value => { setStartupCheck(value); localStorage.setItem("arz.startupCheck", String(value)); }} />
-        <Toggle label="Arka plan durum kontrolü" note="Hazırlık durumunu 15 dakikada bir, indirme başlatmadan kontrol eder." checked={background} onChange={value => { setBackground(value); localStorage.setItem("arz.backgroundRefresh", String(value)); }} />
       </Section>
       <section className="panel future-panel"><span className="eyebrow">YAKINDA</span><h2>Kurulum kaynakları</h2><p>Yeni veri sağlayıcısı ve lisans alanları yalnız gerçek bir sunucu sözleşmesi oluştuğunda burada yer alacak.</p></section>
     </div>

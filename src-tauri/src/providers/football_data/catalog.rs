@@ -1,7 +1,10 @@
 use chrono_tz::Tz;
 use serde::Serialize;
 
-const BASE_URL: &str = "https://www.football-data.co.uk/mmz4281";
+// football-data.co.uk is not reachable from every supported network. This mirror is
+// maintained from the public upstream CSVs and keeps the same season/league layout.
+const BASE_URL: &str =
+    "https://raw.githubusercontent.com/Char2mant/futbol-veri-aynasi/main/data/fd";
 
 #[derive(Debug, Clone, Copy)]
 pub struct DatasetDefinition {
@@ -20,6 +23,13 @@ impl DatasetDefinition {
     }
 
     pub fn source_url(&self) -> String {
+        format!(
+            "https://www.football-data.co.uk/mmz4281/{}/{}.csv",
+            self.season_code, self.league_code
+        )
+    }
+
+    pub fn mirror_url(&self) -> String {
         format!("{BASE_URL}/{}/{}.csv", self.season_code, self.league_code)
     }
 }
@@ -587,17 +597,346 @@ const DATASETS: &[DatasetDefinition] = &[
 ];
 
 pub fn all_datasets() -> &'static [DatasetDefinition] {
-    DATASETS
+    static ALL: std::sync::OnceLock<Vec<DatasetDefinition>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| DATASETS.iter().chain(EXPANDED_DATASETS).copied().collect())
 }
 
+// Divisions published in the official country catalog; imports validate each CSV.
+const EXPANDED_DATASETS: &[DatasetDefinition] = &[
+    dataset!(
+        "E2",
+        "2627",
+        "League One",
+        "England",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "E2",
+        "2526",
+        "League One",
+        "England",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "E2",
+        "2425",
+        "League One",
+        "England",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "E3",
+        "2627",
+        "League Two",
+        "England",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "E3",
+        "2526",
+        "League Two",
+        "England",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "E3",
+        "2425",
+        "League Two",
+        "England",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "EC",
+        "2627",
+        "National League",
+        "England",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "EC",
+        "2526",
+        "National League",
+        "England",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "EC",
+        "2425",
+        "National League",
+        "England",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC0",
+        "2627",
+        "Scottish Premiership",
+        "Scotland",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "SC0",
+        "2526",
+        "Scottish Premiership",
+        "Scotland",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC0",
+        "2425",
+        "Scottish Premiership",
+        "Scotland",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC1",
+        "2627",
+        "Scottish Championship",
+        "Scotland",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "SC1",
+        "2526",
+        "Scottish Championship",
+        "Scotland",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC1",
+        "2425",
+        "Scottish Championship",
+        "Scotland",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC2",
+        "2627",
+        "Scottish League One",
+        "Scotland",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "SC2",
+        "2526",
+        "Scottish League One",
+        "Scotland",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC2",
+        "2425",
+        "Scottish League One",
+        "Scotland",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC3",
+        "2627",
+        "Scottish League Two",
+        "Scotland",
+        "2026/27",
+        chrono_tz::Europe::London,
+        true
+    ),
+    dataset!(
+        "SC3",
+        "2526",
+        "Scottish League Two",
+        "Scotland",
+        "2025/26",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "SC3",
+        "2425",
+        "Scottish League Two",
+        "Scotland",
+        "2024/25",
+        chrono_tz::Europe::London,
+        false
+    ),
+    dataset!(
+        "D2",
+        "2627",
+        "2. Bundesliga",
+        "Germany",
+        "2026/27",
+        chrono_tz::Europe::Berlin,
+        true
+    ),
+    dataset!(
+        "D2",
+        "2526",
+        "2. Bundesliga",
+        "Germany",
+        "2025/26",
+        chrono_tz::Europe::Berlin,
+        false
+    ),
+    dataset!(
+        "D2",
+        "2425",
+        "2. Bundesliga",
+        "Germany",
+        "2024/25",
+        chrono_tz::Europe::Berlin,
+        false
+    ),
+    dataset!(
+        "I2",
+        "2627",
+        "Serie B",
+        "Italy",
+        "2026/27",
+        chrono_tz::Europe::Rome,
+        true
+    ),
+    dataset!(
+        "I2",
+        "2526",
+        "Serie B",
+        "Italy",
+        "2025/26",
+        chrono_tz::Europe::Rome,
+        false
+    ),
+    dataset!(
+        "I2",
+        "2425",
+        "Serie B",
+        "Italy",
+        "2024/25",
+        chrono_tz::Europe::Rome,
+        false
+    ),
+    dataset!(
+        "SP2",
+        "2627",
+        "La Liga 2",
+        "Spain",
+        "2026/27",
+        chrono_tz::Europe::Madrid,
+        true
+    ),
+    dataset!(
+        "SP2",
+        "2526",
+        "La Liga 2",
+        "Spain",
+        "2025/26",
+        chrono_tz::Europe::Madrid,
+        false
+    ),
+    dataset!(
+        "SP2",
+        "2425",
+        "La Liga 2",
+        "Spain",
+        "2024/25",
+        chrono_tz::Europe::Madrid,
+        false
+    ),
+    dataset!(
+        "F2",
+        "2627",
+        "Ligue 2",
+        "France",
+        "2026/27",
+        chrono_tz::Europe::Paris,
+        true
+    ),
+    dataset!(
+        "F2",
+        "2526",
+        "Ligue 2",
+        "France",
+        "2025/26",
+        chrono_tz::Europe::Paris,
+        false
+    ),
+    dataset!(
+        "F2",
+        "2425",
+        "Ligue 2",
+        "France",
+        "2024/25",
+        chrono_tz::Europe::Paris,
+        false
+    ),
+    dataset!(
+        "G1",
+        "2627",
+        "Super League Greece",
+        "Greece",
+        "2026/27",
+        chrono_tz::Europe::Athens,
+        true
+    ),
+    dataset!(
+        "G1",
+        "2526",
+        "Super League Greece",
+        "Greece",
+        "2025/26",
+        chrono_tz::Europe::Athens,
+        false
+    ),
+    dataset!(
+        "G1",
+        "2425",
+        "Super League Greece",
+        "Greece",
+        "2024/25",
+        chrono_tz::Europe::Athens,
+        false
+    ),
+];
+
 pub fn find_dataset(league_code: &str, season_code: &str) -> Option<&'static DatasetDefinition> {
-    DATASETS.iter().find(|dataset| {
+    all_datasets().iter().find(|dataset| {
         dataset.league_code.eq_ignore_ascii_case(league_code) && dataset.season_code == season_code
     })
 }
 
 pub fn supported_datasets() -> Vec<SupportedDataset> {
-    DATASETS
+    all_datasets()
         .iter()
         .map(|dataset| SupportedDataset {
             league_code: dataset.league_code,
@@ -614,4 +953,18 @@ pub fn supported_datasets() -> Vec<SupportedDataset> {
             },
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_url_uses_official_provider() {
+        let dataset = find_dataset("E0", "2627").expect("current Premier League dataset");
+        assert_eq!(
+            dataset.source_url(),
+            "https://www.football-data.co.uk/mmz4281/2627/E0.csv"
+        );
+    }
 }

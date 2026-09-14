@@ -1,10 +1,15 @@
 pub mod assets;
+mod automatic_refresh;
+mod business_clock;
 mod commands;
+mod daily_pipeline;
 mod database;
 pub mod licensing;
+mod logo_discovery;
 pub mod models;
 pub mod providers;
 pub mod repositories;
+mod settlement_scheduler;
 
 use tauri::Manager;
 
@@ -20,12 +25,20 @@ pub fn run() {
                 database::Database::open(app_data_dir.join("football-predictor.sqlite3"))?;
             let asset_manager =
                 assets::AssetSyncManager::new(database.path().to_path_buf(), app_data_dir);
-            asset_manager.start();
+            asset_manager.start_scheduler();
             app.manage(asset_manager);
+            automatic_refresh::start(database.path().to_path_buf(), app.handle().clone());
+            settlement_scheduler::start(database.path().to_path_buf(), app.handle().clone());
             app.manage(database);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::business_clock_get,
+            commands::business_clock_test_set,
+            commands::automatic_refresh_status,
+            commands::model_performance_revision,
+            commands::automatic_refresh_request,
+            commands::automatic_refresh_configure,
             commands::license_status,
             commands::license_activate,
             commands::license_verify,
@@ -33,6 +46,13 @@ pub fn run() {
             commands::database_health,
             commands::database_stats,
             commands::data_center_status,
+            commands::current_pipeline_run,
+            commands::daily_ensure_publication,
+            commands::daily_resolution_status,
+            commands::btts_pipeline_audit,
+            commands::btts_pipeline_latest,
+            commands::btts_pipeline_replay,
+            commands::btts_pipeline_refresh,
             commands::resolver_scan,
             commands::resolver_apply_safe_matches,
             commands::resolver_get_review_queue,
@@ -56,6 +76,9 @@ pub fn run() {
             commands::iddaa_import_local_bulletin,
             commands::iddaa_bulletin_status,
             commands::iddaa_get_upcoming_matches,
+            commands::daily_get_matches,
+            commands::daily_publication_id,
+            commands::daily_selection_output,
             commands::iddaa_get_latest_odds,
             commands::iddaa_refresh_popularity,
             commands::iddaa_popularity_status,
@@ -65,6 +88,7 @@ pub fn run() {
             commands::asset_sync_status,
             commands::asset_sync_retry_failed,
             commands::entity_logo_path,
+            commands::asset_prioritize_matches,
             commands::feature_engine_generate_for_match,
             commands::feature_engine_generate_dataset,
             commands::feature_engine_market_readiness,
@@ -80,6 +104,7 @@ pub fn run() {
             commands::prediction_backtest_status,
             commands::prediction_calibration_fit,
             commands::prediction_calibration_validate,
+            commands::goal_calibration_revalidate,
             commands::prediction_calibration_activate,
             commands::prediction_calibration_buckets,
             commands::prediction_model_performance,
@@ -98,6 +123,7 @@ pub fn run() {
             commands::coupon_engine_update_draft_selections,
             commands::coupon_engine_finalize,
             commands::coupon_engine_get_coupon,
+            commands::compound_search_status,
             commands::coupon_engine_lineup_revision_impact,
             commands::coupon_engine_system_preview,
             commands::coupon_engine_get_daily,

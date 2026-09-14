@@ -1,3 +1,14 @@
+use rusqlite::OptionalExtension;
+#[tauri::command]
+pub fn business_clock_get() -> crate::business_clock::Snapshot {
+    crate::business_clock::snapshot()
+}
+#[tauri::command]
+pub fn business_clock_test_set(
+    datetime: Option<String>,
+) -> Result<crate::business_clock::Snapshot, String> {
+    crate::business_clock::set_test(datetime.as_deref())
+}
 use serde::Deserialize;
 use tauri::{AppHandle, Manager, State};
 
@@ -471,6 +482,25 @@ pub fn prediction_calibration_fit(
 }
 
 #[tauri::command]
+pub fn goal_calibration_revalidate(
+    database: State<'_, Database>,
+    output_path: String,
+    version: String,
+) -> Result<crate::repositories::calibration::CalibrationReport, String> {
+    let mut c = database.connection()?;
+    let tx = c
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let result = crate::repositories::calibration::revalidate_goal_families(
+        &tx,
+        std::path::Path::new(&output_path),
+        &version,
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+#[tauri::command]
 pub fn prediction_calibration_validate(request: PredictionArtifactRequest) -> Result<bool, String> {
     crate::repositories::calibration::load_calibration(std::path::Path::new(&request.artifact_path))
         .map(|_| true)
@@ -518,7 +548,7 @@ pub fn candidate_engine_generate_daily(
     request: CandidateGenerateRequest,
 ) -> Result<crate::repositories::candidate_engine::DailyRun, String> {
     let c = database.connection()?;
-    crate::repositories::candidate_engine::generate(
+    crate::repositories::candidate_engine::generate_daily_output(
         &c,
         &crate::repositories::candidate_engine::GenerateRequest {
             business_date: request.business_date,
@@ -526,6 +556,67 @@ pub fn candidate_engine_generate_daily(
             category: request.category,
             dry_run: request.dry_run,
         },
+    )
+}
+
+#[tauri::command]
+pub fn btts_pipeline_audit(
+    database: State<'_, Database>,
+    business_date: String,
+    as_of: Option<String>,
+) -> Result<crate::repositories::btts_pipeline::Audit, String> {
+    let c = database.connection()?;
+    crate::repositories::btts_pipeline::audit(&c, &business_date, as_of.as_deref())
+}
+
+#[tauri::command]
+pub fn btts_pipeline_latest(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<crate::repositories::btts_pipeline::Audit, String> {
+    let c = database.connection()?;
+    crate::repositories::btts_pipeline::latest(&c, &business_date)
+}
+
+#[tauri::command]
+pub fn btts_pipeline_replay(
+    database: State<'_, Database>,
+    business_date: String,
+    as_of: String,
+) -> Result<crate::repositories::btts_pipeline::Audit, String> {
+    let cutoff = chrono::DateTime::parse_from_rfc3339(&as_of).map_err(|e| e.to_string())?;
+    if cutoff > chrono::Utc::now() {
+        return Err("FUTURE_AS_OF_NOT_ALLOWED".into());
+    }
+    let c = database.connection()?;
+    crate::repositories::btts_pipeline::publish(&c, &business_date, &as_of, None)
+}
+
+#[tauri::command]
+pub async fn btts_pipeline_refresh(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<crate::repositories::btts_pipeline::Audit, String> {
+    let today = chrono::Utc::now()
+        .with_timezone(&chrono_tz::Europe::Istanbul)
+        .date_naive()
+        .to_string();
+    if business_date < today {
+        return Err("HISTORICAL_REPLAY_REQUIRES_AS_OF".into());
+    }
+    let (bytes, captured) = crate::providers::iddaa::download_btts_bulletin().await?;
+    let c = database.connection()?;
+    let prices = crate::repositories::btts_pipeline::import_prices(&c, &bytes, &captured)?;
+    let predictions = crate::repositories::btts_pipeline::refresh_predictions(
+        &c,
+        &business_date,
+        &chrono::Utc::now().to_rfc3339(),
+    )?;
+    crate::repositories::btts_pipeline::publish(
+        &c,
+        &business_date,
+        &chrono::Utc::now().to_rfc3339(),
+        Some(serde_json::json!({"prices":prices,"predictions":predictions})),
     )
 }
 
@@ -591,12 +682,47 @@ pub fn model_supported_populars_get(
 }
 
 #[tauri::command]
-pub fn model_performance_get(
+pub async fn model_performance_revision(database: State<'_, Database>) -> Result<i64, String> {
+    let path = database.path().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        let c =
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|e| e.to_string())?;
+        c.query_row(
+            "SELECT version FROM model_performance_epoch WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn model_performance_get(
     database: State<'_, Database>,
     request: crate::repositories::model_performance::ModelPerformanceRequest,
 ) -> Result<crate::repositories::model_performance::ModelPerformanceResponse, String> {
-    let connection = database.connection()?;
-    crate::repositories::model_performance::get(&connection, &request)
+    let started = std::time::Instant::now();
+    let path = database.path().to_path_buf();
+    let response = tauri::async_runtime::spawn_blocking(move || {
+        crate::repositories::model_performance::cached(path, request)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    #[cfg(debug_assertions)]
+    {
+        let serialize = std::time::Instant::now();
+        let bytes = serde_json::to_vec(&response).map_err(|e| e.to_string())?;
+        eprintln!(
+            "MODEL_PERFORMANCE command_ms={:.3} serialization_ms={:.3} bytes={}",
+            started.elapsed().as_secs_f64() * 1000.0,
+            serialize.elapsed().as_secs_f64() * 1000.0,
+            bytes.len()
+        );
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -663,6 +789,15 @@ pub fn coupon_engine_finalize(
     let c = database.connection()?;
     crate::repositories::coupon_engine::finalize(&c, request.coupon_id)
 }
+#[tauri::command]
+pub fn compound_search_status(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<crate::repositories::coupon_engine::CompoundSearch, String> {
+    let c = database.connection()?;
+    crate::repositories::coupon_engine::compound_search_status(&c, &business_date)
+}
+
 #[tauri::command]
 pub fn coupon_engine_get_coupon(
     database: State<'_, Database>,
@@ -737,12 +872,16 @@ pub fn compound_series_settle_step(
     request: SeriesSettleRequest,
 ) -> Result<crate::repositories::coupon_engine::CompoundSeries, String> {
     let c = database.connection()?;
-    crate::repositories::coupon_engine::settle_series(
-        &c,
+    let tx = rusqlite::Transaction::new_unchecked(&c, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let result = crate::repositories::coupon_engine::settle_series(
+        &tx,
         request.series_id,
         request.won,
         request.gross_return_cents,
-    )
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
 }
 #[tauri::command]
 pub fn coupon_engine_settle(
@@ -750,14 +889,18 @@ pub fn coupon_engine_settle(
     request: CouponSettlementRequest,
 ) -> Result<crate::repositories::coupon_engine::SettlementResult, String> {
     let c = database.connection()?;
-    crate::repositories::coupon_engine::settle(
-        &c,
+    let tx = rusqlite::Transaction::new_unchecked(&c, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let result = crate::repositories::coupon_engine::settle(
+        &tx,
         &crate::repositories::coupon_engine::SettlementRequest {
             coupon_id: request.coupon_id,
             outcomes: request.outcomes,
             settled_at: request.settled_at,
         },
-    )
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
 }
 #[tauri::command]
 pub fn compound_series_generate_step(
@@ -765,11 +908,15 @@ pub fn compound_series_generate_step(
     request: CouponDailyRequest,
 ) -> Result<crate::repositories::coupon_engine::Coupon, String> {
     let c = database.connection()?;
-    crate::repositories::coupon_engine::generate_compound_step(
-        &c,
+    let tx = rusqlite::Transaction::new_unchecked(&c, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let result = crate::repositories::coupon_engine::generate_compound_step(
+        &tx,
         &request.business_date,
         request.candidate_run_id,
-    )
+    )?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
 }
 #[tauri::command]
 pub fn compound_series_cancel(
@@ -958,6 +1105,11 @@ pub fn prediction_model_activate(
     crate::repositories::prediction_engine::activate(&c, &request.model_version)
 }
 
+#[tauri::command]
+pub async fn current_pipeline_run() -> Result<crate::automatic_refresh::Status, String> {
+    crate::automatic_refresh::request(false)
+}
+
 fn predict_one(
     c: &rusqlite::Connection,
     match_id: i64,
@@ -999,6 +1151,12 @@ pub fn prediction_generate_upcoming(
         .prepare(
             "SELECT id FROM matches
              WHERE status='scheduled'
+               AND EXISTS(SELECT 1 FROM provider_match_mappings pm
+                          WHERE pm.match_id=matches.id AND pm.provider='iddaa')
+               AND EXISTS(SELECT 1 FROM provider_team_mappings h
+                          WHERE h.team_id=matches.home_team_id AND h.provider<>'iddaa')
+               AND EXISTS(SELECT 1 FROM provider_team_mappings a
+                          WHERE a.team_id=matches.away_team_id AND a.provider<>'iddaa')
                AND (?1 IS NULL OR competition_id=?1)
                AND (?2 IS NULL OR scheduled_local_date>=?2)
                AND (?3 IS NULL OR scheduled_local_date<=?3)
@@ -1090,8 +1248,34 @@ pub fn asset_sync_retry_failed(
     manager.retry_failed()
 }
 #[tauri::command]
+pub fn asset_prioritize_matches(
+    database: State<'_, Database>,
+    manager: State<'_, crate::assets::AssetSyncManager>,
+    match_ids: Vec<i64>,
+) -> Result<(), String> {
+    let c = database.connection()?;
+    for id in match_ids.into_iter().take(200) {
+        let teams: Option<(i64, i64)> = c
+            .query_row(
+                "SELECT home_team_id,away_team_id FROM matches WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        if let Some((h, a)) = teams {
+            crate::assets::request_asset(&c, "TEAM", h, 100)?;
+            crate::assets::request_asset(&c, "TEAM", a, 100)?;
+        }
+    }
+    manager.start();
+    Ok(())
+}
+
+#[tauri::command]
 pub fn entity_logo_path(
     database: State<'_, Database>,
+    manager: State<'_, crate::assets::AssetSyncManager>,
     request: EntityLogoPathRequest,
 ) -> Result<Option<String>, String> {
     let c = database.connection()?;
@@ -1101,6 +1285,21 @@ pub fn entity_logo_path(
             .parent()
             .ok_or("database path has no parent")?,
     );
+    if let Some(path) = crate::assets::logo_path(
+        &c,
+        &root,
+        &request.entity_type.trim().to_ascii_uppercase(),
+        request.entity_id,
+    )? {
+        return Ok(Some(path));
+    }
+    crate::assets::request_asset(
+        &c,
+        &request.entity_type.trim().to_ascii_uppercase(),
+        request.entity_id,
+        100,
+    )?;
+    manager.start();
     crate::assets::logo_path(
         &c,
         &root,
@@ -1413,15 +1612,25 @@ pub fn football_data_quality_summary(
 }
 
 #[tauri::command]
-pub async fn iddaa_refresh_bulletin(
-    database: State<'_, Database>,
-    asset_manager: State<'_, crate::assets::AssetSyncManager>,
-) -> Result<crate::providers::iddaa::RefreshSummary, String> {
-    let result = crate::providers::iddaa::refresh_bulletin(database.inner()).await;
-    if result.is_ok() {
-        trigger_asset_discovery(asset_manager.inner())
-    }
-    result
+pub async fn iddaa_refresh_bulletin() -> Result<crate::automatic_refresh::Status, String> {
+    crate::automatic_refresh::request(false)
+}
+
+#[tauri::command]
+pub fn automatic_refresh_status() -> Result<crate::automatic_refresh::Status, String> {
+    crate::automatic_refresh::status()
+}
+#[tauri::command]
+pub fn automatic_refresh_request(
+    stale_only: bool,
+) -> Result<crate::automatic_refresh::Status, String> {
+    crate::automatic_refresh::request(stale_only)
+}
+#[tauri::command]
+pub fn automatic_refresh_configure(
+    settings: crate::automatic_refresh::Settings,
+) -> Result<crate::automatic_refresh::Status, String> {
+    crate::automatic_refresh::configure(settings)
 }
 
 #[tauri::command]
@@ -1449,6 +1658,114 @@ pub fn iddaa_bulletin_status(
 }
 
 #[tauri::command]
+pub fn daily_publication_id(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<Option<i64>, String> {
+    let c = database.connection()?;
+    crate::repositories::candidate_engine::selected_run_id(&c, &business_date)
+}
+
+#[tauri::command]
+pub async fn daily_ensure_publication(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<String, String> {
+    let date = chrono::NaiveDate::parse_from_str(&business_date, "%Y-%m-%d")
+        .map_err(|_| "INVALID_BUSINESS_DATE")?;
+    let today = crate::business_clock::today();
+    // A one-day clock skew is tolerated at midnight. This endpoint never replays history.
+    if date < today || date > today + chrono::Duration::days(1) {
+        return Err("CURRENT_BUSINESS_DATE_REQUIRED".into());
+    }
+    let path = database.path().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        // The scheduler owns a rollover publication. Wait before opening the DB
+        // so frontend ensure cannot race it into generating a second daily run.
+        if date == today {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while crate::automatic_refresh::status()
+                .is_ok_and(|s| crate::automatic_refresh::publication_in_flight(&s, &business_date))
+            {
+                if std::time::Instant::now() >= deadline {
+                    return Err("DAILY_REFRESH_STILL_RUNNING".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let db = Database::open(path).map_err(|e| e.to_string())?;
+        let c = db.connection()?;
+        let batch = {
+            let _guard = crate::daily_pipeline::PRODUCTION_LOCK
+                .lock()
+                .map_err(|_| "PIPELINE_LOCK_POISONED")?;
+            crate::repositories::incremental_resolution::process(&c, 64)
+                .map_err(|e| e.to_string())?
+        };
+        if batch.resolved > 0 {
+            crate::repositories::current_flow::run(&c)?;
+        }
+        let _guard = crate::daily_pipeline::PRODUCTION_LOCK
+            .lock()
+            .map_err(|_| "PIPELINE_LOCK_POISONED")?;
+        if crate::repositories::candidate_engine::selected_run_id(&c, &business_date)?.is_none() {
+            crate::repositories::candidate_engine::generate_daily_output(
+                &c,
+                &crate::repositories::candidate_engine::GenerateRequest {
+                    business_date: Some(business_date.clone()),
+                    generation_time: None,
+                    category: None,
+                    dry_run: Some(false),
+                },
+            )?;
+        }
+        for kind in ["DAILY_OVER_25", "DAILY_OVER_35"] {
+            crate::repositories::coupon_engine::generate_daily(
+                &c,
+                &crate::repositories::coupon_engine::GenerateRequest {
+                    business_date: business_date.clone(),
+                    candidate_run_id: None,
+                    coupon_type: Some(kind.into()),
+                    unit_stake_cents: None,
+                },
+            )?;
+        }
+        Ok(crate::repositories::daily_selections::publication(&c, &business_date)?.id)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn daily_resolution_status(
+    database: State<'_, Database>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let c = database.connection()?;
+    let mut q=c.prepare("SELECT q.provider_event_id,m.competition_id,co.name,h.normalized_name,a.normalized_name,m.kickoff_at,q.status,q.attempts,q.reason,q.evidence_json,q.next_retry_at FROM daily_resolution_queue q JOIN matches m ON m.id=q.match_id JOIN competitions co ON co.id=m.competition_id JOIN teams h ON h.id=m.home_team_id JOIN teams a ON a.id=m.away_team_id WHERE q.status<>'RESOLVED' AND q.status<>'UNSUPPORTED' AND m.status='scheduled' AND m.kickoff_at>strftime('%Y-%m-%dT%H:%M:%SZ','now') ORDER BY m.kickoff_at LIMIT 128").map_err(|e|e.to_string())?;
+    let rows=q.query_map([],|r|Ok(serde_json::json!({"provider_event_id":r.get::<_,String>(0)?,"competition_id":r.get::<_,i64>(1)?,"competition":r.get::<_,String>(2)?,"home":r.get::<_,String>(3)?,"away":r.get::<_,String>(4)?,"kickoff":r.get::<_,String>(5)?,"status":r.get::<_,String>(6)?,"attempts":r.get::<_,i64>(7)?,"reason":r.get::<_,Option<String>>(8)?,"candidates":serde_json::from_str::<serde_json::Value>(&r.get::<_,String>(9)?).unwrap_or_default(),"next_retry_at":r.get::<_,Option<String>>(10)?}))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    Ok(rows)
+}
+#[tauri::command]
+pub fn daily_selection_output(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<crate::repositories::daily_selections::DailyOutput, String> {
+    let c = database.connection()?;
+    crate::repositories::daily_selections::get(&c, &business_date)
+}
+#[tauri::command]
+pub fn daily_get_matches(
+    database: State<'_, Database>,
+    business_date: String,
+) -> Result<Vec<crate::repositories::iddaa::UpcomingMatch>, String> {
+    chrono::NaiveDate::parse_from_str(&business_date, "%Y-%m-%d")
+        .map_err(|_| "INVALID_BUSINESS_DATE")?;
+    let c = database.connection()?;
+    crate::repositories::iddaa::matches_for_date(&c, Some(&business_date))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn iddaa_get_upcoming_matches(
     database: State<'_, Database>,
 ) -> Result<Vec<crate::repositories::iddaa::UpcomingMatch>, String> {
@@ -1467,10 +1784,8 @@ pub fn iddaa_get_latest_odds(
 }
 
 #[tauri::command]
-pub async fn iddaa_refresh_popularity(
-    database: State<'_, Database>,
-) -> Result<crate::providers::iddaa::PopularityRefreshSummary, String> {
-    crate::providers::iddaa::refresh_popularity(database.inner()).await
+pub async fn iddaa_refresh_popularity() -> Result<crate::automatic_refresh::Status, String> {
+    crate::automatic_refresh::request(false)
 }
 
 #[tauri::command]

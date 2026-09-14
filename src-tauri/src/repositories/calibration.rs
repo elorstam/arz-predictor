@@ -17,7 +17,12 @@ use std::{
 static BACKTEST_RUN_NONCE: AtomicUsize = AtomicUsize::new(0);
 
 pub const MIN_INITIAL_TRAINING_ROWS: usize = 100;
-pub const TEST_WINDOW: usize = 10;
+// Production corpora contain thousands of rows. A ten-row window retrains the
+// complete model hundreds of times and makes first-run calibration impractical.
+// Five hundred rows preserves chronological out-of-sample evaluation while
+// keeping the number of folds bounded for the supported three-season preset.
+pub const MIN_TEST_WINDOW: usize = 10;
+pub const MAX_TEST_WINDOW: usize = 500;
 pub const MIN_CALIBRATION_SAMPLES: usize = 20;
 pub const MIN_BUCKET_SAMPLE: usize = 20;
 pub const MIN_PERFORMANCE_GROUP_SAMPLE: usize = 20;
@@ -433,14 +438,18 @@ pub fn walk_forward(c: &Connection, model_version: &str) -> Result<BacktestRepor
         pe::ensure_count_label(c, id)?;
     }
     let rows = source_rows(c)?;
-    if rows.len() < MIN_INITIAL_TRAINING_ROWS + TEST_WINDOW {
+    if rows.len() < MIN_INITIAL_TRAINING_ROWS + MIN_TEST_WINDOW {
         return Err("INSUFFICIENT_BACKTEST_DATA".into());
     }
+    let remaining = rows.len() - MIN_INITIAL_TRAINING_ROWS;
+    let test_window = remaining
+        .div_ceil(15)
+        .clamp(MIN_TEST_WINDOW, MAX_TEST_WINDOW);
     let mut obs = Vec::new();
     let mut sizes = Vec::new();
     let (mut fold, mut start) = (0, MIN_INITIAL_TRAINING_ROWS);
     while start < rows.len() {
-        let end = (start + TEST_WINDOW).min(rows.len());
+        let end = (start + test_window).min(rows.len());
         let tc = training_connection(&rows[..start])?;
         let nonce = BACKTEST_RUN_NONCE.fetch_add(1, Ordering::Relaxed);
         let dir =
@@ -510,7 +519,7 @@ pub fn walk_forward(c: &Connection, model_version: &str) -> Result<BacktestRepor
         "initial_training_rows".into(),
         MIN_INITIAL_TRAINING_ROWS.to_string(),
     );
-    cfg.insert("test_window".into(), TEST_WINDOW.to_string());
+    cfg.insert("test_window".into(), test_window.to_string());
     cfg.insert("oos_only".into(), "true".into());
     Ok(BacktestReport {
         run_id: None,
@@ -530,6 +539,153 @@ pub fn walk_forward(c: &Connection, model_version: &str) -> Result<BacktestRepor
     })
 }
 
+// Keep every fixture in one partition and use time, never database identity.
+pub(crate) fn chronological_fit_matches(report: &BacktestReport) -> Result<BTreeSet<i64>, String> {
+    let mut times = BTreeMap::new();
+    for o in &report.observations {
+        if !o.out_of_sample {
+            return Err("CALIBRATION_REQUIRES_OOS".into());
+        }
+        let time = chrono::DateTime::parse_from_rfc3339(&o.cutoff)
+            .map_err(|_| "INVALID_OOS_CUTOFF")?
+            .timestamp();
+        if times
+            .insert(o.match_id, time)
+            .is_some_and(|old| old != time)
+        {
+            return Err("INCONSISTENT_OOS_CUTOFF".into());
+        }
+    }
+    let mut ordered: Vec<_> = times.iter().map(|(id, time)| (*time, *id)).collect();
+    ordered.sort();
+    let boundary = ordered.get(ordered.len() / 2).ok_or("EMPTY_OOS")?.0;
+    let fit: BTreeSet<_> = ordered
+        .into_iter()
+        .filter(|(time, _)| *time < boundary)
+        .map(|(_, id)| id)
+        .collect();
+    if fit.is_empty() {
+        return Err("INSUFFICIENT_CHRONOLOGICAL_OOS".into());
+    }
+    Ok(fit)
+}
+
+/// Revalidate only goal-family adjustments against existing chronological OOS.
+/// Preserve the active artifact's other families byte-for-byte at the parameter level.
+pub fn revalidate_goal_families(
+    c: &Connection,
+    path: &Path,
+    version: &str,
+) -> Result<CalibrationReport, String> {
+    let old_path: String = c
+        .query_row(
+            "SELECT artifact_path FROM calibration_models WHERE is_active=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let base_path: String = c
+        .query_row(
+            "SELECT artifact_path FROM model_versions WHERE is_active=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let base = pe::load_artifact(Path::new(&base_path))?;
+    let run: i64 = c.query_row("SELECT id FROM backtest_runs WHERE status='COMPLETED' AND model_family_version=?1 ORDER BY id DESC LIMIT 1",[&base.bundle.model_version],|r|r.get(0)).map_err(|e|e.to_string())?;
+    let report = load_backtest_report(c, run)?;
+    let fit_ids = chronological_fit_matches(&report)?;
+    let mut a = load_calibration(Path::new(&old_path))?;
+    if a.parent_model_version != base.bundle.model_version
+        || a.parent_artifact_sha256 != sha(&base.bundle)?
+    {
+        return Err("CALIBRATION_PARENT_MISMATCH".into());
+    }
+    for family_name in ["BTTS", "TOTAL_GOALS"] {
+        let fit: Vec<_> = report
+            .observations
+            .iter()
+            .filter(|o| fit_ids.contains(&o.match_id) && family(&o.market) == family_name)
+            .map(|o| (o.raw_probability, o.actual))
+            .collect();
+        let eval: Vec<_> = report
+            .observations
+            .iter()
+            .filter(|o| !fit_ids.contains(&o.match_id) && family(&o.market) == family_name)
+            .cloned()
+            .collect();
+        if fit.len() < MIN_CALIBRATION_SAMPLES || eval.len() < MIN_CALIBRATION_SAMPLES {
+            return Err("INSUFFICIENT_GOAL_OOS".into());
+        }
+        let (slope, intercept) = platt(&fit);
+        let calibrated: Vec<_> = eval
+            .iter()
+            .cloned()
+            .map(|mut o| {
+                o.calibrated_probability = Some(cal_binary(o.raw_probability, slope, intercept));
+                o
+            })
+            .collect();
+        let raw = metric(&eval, false);
+        let cal = metric(&calibrated, true);
+        let status = if cal.log_loss <= raw.log_loss && cal.ece <= raw.ece + 0.02 {
+            "CALIBRATED_V1"
+        } else {
+            "CALIBRATION_NOT_BENEFICIAL"
+        };
+        let param = CalibrationParam {
+            method: "PLATT_LOGISTIC".into(),
+            a: slope,
+            b: intercept,
+            temperature: None,
+            sample_count: fit.len(),
+            status: status.into(),
+        };
+        a.component_hashes.insert(family_name.into(), sha(&param)?);
+        a.parameters.insert(family_name.into(), param);
+        a.raw_metrics.insert(family_name.into(), raw);
+        a.calibrated_metrics.insert(family_name.into(), cal);
+    }
+    a.calibration_configuration.insert(
+        "goal_partition".into(),
+        "chronological_first_half_fit_later_half_validation_v2".into(),
+    );
+    a.calibration_configuration.insert(
+        "goal_fit_through".into(),
+        report
+            .observations
+            .iter()
+            .filter(|o| fit_ids.contains(&o.match_id))
+            .map(|o| o.cutoff.clone())
+            .max()
+            .unwrap(),
+    );
+    a.calibration_configuration.insert(
+        "preserved_non_goal_families_from".into(),
+        a.calibration_version.clone(),
+    );
+    a.calibration_version = version.into();
+    a.created_at = Utc::now().to_rfc3339();
+    a = serde_json::from_slice(&serde_json::to_vec(&a).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    a.artifact_sha256 = calibration_hash(&a)?;
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&a).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let result = CalibrationReport {
+        artifact_path: path.to_string_lossy().into(),
+        artifact_sha256: a.artifact_sha256,
+        methods_fitted: vec!["BTTS".into(), "TOTAL_GOALS".into()],
+        skipped: BTreeMap::new(),
+        raw_metrics: a.raw_metrics,
+        calibrated_metrics: a.calibrated_metrics,
+    };
+    persist_calibration_for_run(c, &result, &base, run)?;
+    Ok(result)
+}
+
 pub fn fit_calibration(
     base: &pe::ArtifactFile,
     report: &BacktestReport,
@@ -544,15 +700,7 @@ pub fn fit_calibration_version(
     path: &Path,
     requested_version: Option<&str>,
 ) -> Result<CalibrationReport, String> {
-    let ordered_matches: Vec<i64> = report
-        .observations
-        .iter()
-        .map(|o| o.match_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let split = ordered_matches.len() / 2;
-    let fit_matches: BTreeSet<i64> = ordered_matches[..split].iter().copied().collect();
+    let fit_matches = chronological_fit_matches(report)?;
     let (fit, eval): (Vec<_>, Vec<_>) = report
         .observations
         .iter()

@@ -1,10 +1,11 @@
 mod acquisition;
-mod dto;
+pub(crate) mod dto;
 pub(crate) mod markets;
 mod orchestrator;
 mod popularity;
 mod popularity_dto;
 
+pub use orchestrator::download_btts_bulletin;
 pub use orchestrator::{import_local_bulletin, refresh_bulletin, IngestionIssue, RefreshSummary};
 pub use popularity::{refresh as refresh_popularity, PopularityIssue, PopularityRefreshSummary};
 

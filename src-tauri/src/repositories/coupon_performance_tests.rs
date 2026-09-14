@@ -55,6 +55,11 @@ fn fixture() -> crate::database::Database {
     )
     .unwrap()
     .run_id;
+    c.execute(
+        "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+        [run],
+    )
+    .unwrap();
     add_coupon(
         &c,
         1,
@@ -216,6 +221,18 @@ fn request(window: super::model_performance::PerformanceWindow) -> CouponPerform
         include_system: None,
         include_katlama: None,
     }
+}
+
+#[test]
+fn realized_performance_excludes_replay_even_when_it_contains_settled_rows() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    let req = request(super::model_performance::PerformanceWindow::AllTime);
+    assert!(get(&c, &req).unwrap().overall.settled_count > 0);
+    c.execute("UPDATE candidate_run_execution SET purpose='REPLAY'", [])
+        .unwrap();
+    assert_eq!(get(&c, &req).unwrap().overall.settled_count, 0);
+    assert_eq!(get(&c, &req).unwrap().overall.total_stake_cents, 0);
 }
 
 #[test]

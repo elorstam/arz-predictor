@@ -3,7 +3,7 @@ use super::candidate_engine::{self, Candidate};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-pub const COUPON_POLICY_VERSION: &str = "coupon_policy_v1";
+pub const COUPON_POLICY_VERSION: &str = "coupon_policy_v4_goals_3_to_5";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CouponPolicy {
@@ -18,7 +18,7 @@ pub fn policy() -> CouponPolicy {
     CouponPolicy {
         version: COUPON_POLICY_VERSION.into(),
         high_confidence_target_odd: 3.0,
-        compound_target_odd: 1.70,
+        compound_target_odd: 1.80,
         compound_odd_range: [1.50, 1.80],
         compound_max_legs: 3,
         katlama_max_step: 7,
@@ -38,6 +38,7 @@ pub struct Coupon {
     pub series_id: Option<i64>,
     pub step_number: Option<usize>,
     pub status: String,
+    pub publication_status: String,
     pub candidate_ids: Vec<i64>,
     pub selections: Vec<CouponSelectionSnapshot>,
     pub system_sizes: Vec<usize>,
@@ -93,6 +94,8 @@ fn display_name(kind: &str) -> &'static str {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CouponSelectionSnapshot {
+    pub settlement_state: String,
+    pub settlement_reason: Option<String>,
     pub candidate_id: i64,
     pub match_id: i64,
     pub competition_id: i64,
@@ -295,10 +298,10 @@ fn validate_selection_set(kind: &str, selected: &[Candidate]) -> Result<Vec<usiz
         }
         let odd = combined(selected);
         let p = policy();
-        if odd < p.compound_odd_range[0] {
+        if odd + 1e-9 < p.compound_odd_range[0] {
             return Err("COMPOUND_ODDS_BELOW_MINIMUM".into());
         }
-        if odd > p.compound_odd_range[1] {
+        if odd - 1e-9 > p.compound_odd_range[1] {
             return Err("COMPOUND_ODDS_ABOVE_MAXIMUM".into());
         }
     }
@@ -340,6 +343,7 @@ fn insert_coupon(
     unit: Option<i64>,
     target: bool,
 ) -> Result<i64, String> {
+    validate_selection_set(kind, selected)?;
     if let Some(existing) = c.query_row("SELECT id FROM phase8_coupons WHERE business_date=?1 AND source_candidate_run_id=?2 AND coupon_type=?3 AND policy_version=?4", params![run.business_date,run.run_id,kind,COUPON_POLICY_VERSION], |x| x.get(0)).optional().map_err(|e|e.to_string())? { return Ok(existing); }
     let metadata = serde_json::json!({"source_run_identity":run.run_id,"generation_cutoff":run.generated_at,"naive_independent_probability":selected.iter().fold(1.0,|a,x|a*x.public_probability)});
     let total = unit.map(|u| {
@@ -411,6 +415,151 @@ pub fn create_draft(c: &Connection, r: &DraftRequest) -> Result<Coupon, String> 
     get_coupon(c, id)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompoundCombination {
+    pub candidate_ids: Vec<i64>,
+    pub combined_odd: f64,
+    pub quality: f64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompoundSearch {
+    pub pool_size: usize,
+    pub pairs_evaluated: usize,
+    pub triples_evaluated: usize,
+    pub correlated_rejected: usize,
+    pub valid_combinations: usize,
+    pub closest: Vec<(f64, Option<CompoundCombination>)>,
+    pub chosen: Option<CompoundCombination>,
+    pub reason: String,
+}
+pub fn search_compound(candidates: &[Candidate]) -> CompoundSearch {
+    let mut pool: Vec<_> = candidates
+        .iter()
+        .filter(|x| {
+            x.category == "COMPOUND"
+                && x.qualification_state == "QUALIFIED"
+                && x.compound_eligible
+                && x.iddaa_odd.is_finite()
+                && x.iddaa_odd > 1.0
+        })
+        .collect();
+    pool.sort_by_key(|x| x.id);
+    pool.dedup_by_key(|x| x.id);
+    let mut out = CompoundSearch {
+        pool_size: pool.len(),
+        pairs_evaluated: 0,
+        triples_evaluated: 0,
+        correlated_rejected: 0,
+        valid_combinations: 0,
+        closest: vec![(1.5, None), (1.6, None), (1.7, None), (1.8, None)],
+        chosen: None,
+        reason: "NO_COMBINATION_IN_RANGE".into(),
+    };
+    if pool.len() > 256 {
+        out.reason = "SEARCH_LIMIT_REACHED".into();
+        return out;
+    }
+    let pol = policy();
+    for size in [2, 3] {
+        if size == 3
+            && out
+                .chosen
+                .as_ref()
+                .is_some_and(|x| (x.combined_odd - 1.8).abs() < 1e-9)
+        {
+            break;
+        }
+        for i in 0..pool.len() {
+            for j in i + 1..pool.len() {
+                let last: Vec<Option<usize>> = if size == 2 {
+                    vec![None]
+                } else {
+                    (j + 1..pool.len()).map(Some).collect()
+                };
+                for k in last {
+                    if size == 2 {
+                        out.pairs_evaluated += 1
+                    } else {
+                        out.triples_evaluated += 1
+                    };
+                    let mut picks = vec![pool[i], pool[j]];
+                    if let Some(k) = k {
+                        picks.push(pool[k]);
+                    }
+                    if picks
+                        .iter()
+                        .map(|p| p.match_id)
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                        != size
+                    {
+                        out.correlated_rejected += 1;
+                        continue;
+                    }
+                    let odd = picks.iter().map(|p| p.iddaa_odd).product::<f64>();
+                    let item = CompoundCombination {
+                        candidate_ids: picks.iter().map(|p| p.id).collect(),
+                        combined_odd: odd,
+                        quality: picks.iter().map(|p| p.score).sum::<f64>() / size as f64,
+                    };
+                    for (target, closest) in &mut out.closest {
+                        if closest
+                            .as_ref()
+                            .map(|old| (odd - *target).abs() < (old.combined_odd - *target).abs())
+                            .unwrap_or(true)
+                        {
+                            *closest = Some(item.clone());
+                        }
+                    }
+                    if odd + 1e-9 < pol.compound_odd_range[0]
+                        || odd - 1e-9 > pol.compound_odd_range[1]
+                    {
+                        continue;
+                    }
+                    out.valid_combinations += 1;
+                    // Exact 1.80 first, then near-target quality, then quality within the permitted band.
+                    let tier = |o: f64| {
+                        if (o - 1.8).abs() < 1e-9 {
+                            2
+                        } else if o >= 1.75 {
+                            1
+                        } else {
+                            0
+                        }
+                    };
+                    if out
+                        .chosen
+                        .as_ref()
+                        .map(|old| {
+                            tier(odd) > tier(old.combined_odd)
+                                || (tier(odd) == tier(old.combined_odd)
+                                    && (item.quality > old.quality
+                                        || (item.quality == old.quality && odd > old.combined_odd)))
+                        })
+                        .unwrap_or(true)
+                    {
+                        out.chosen = Some(item);
+                    }
+                }
+            }
+        }
+    }
+    out.reason = if out.chosen.is_some() {
+        "FOUND"
+    } else if pool.len() < 2 {
+        "INSUFFICIENT_ELIGIBLE_CANDIDATES"
+    } else if out.pairs_evaluated + out.triples_evaluated == out.correlated_rejected {
+        "ALL_COMBINATIONS_CORRELATED"
+    } else {
+        "NO_COMBINATION_IN_RANGE"
+    }
+    .into();
+    out
+}
+pub fn compound_search_status(c: &Connection, date: &str) -> Result<CompoundSearch, String> {
+    Ok(search_compound(&source(c, date, None)?.candidates))
+}
+
 pub fn generate_daily(c: &Connection, r: &GenerateRequest) -> Result<Vec<Coupon>, String> {
     let run = source(c, &r.business_date, r.candidate_run_id)?;
     let kinds: Vec<&str> = r
@@ -421,6 +570,13 @@ pub fn generate_daily(c: &Connection, r: &GenerateRequest) -> Result<Vec<Coupon>
     let mut out = Vec::new();
     for kind in kinds {
         let Some(cat) = category(kind) else { continue };
+        let category_run = if r.candidate_run_id.is_none() {
+            let p = super::daily_selections::publication(c, &r.business_date)?;
+            Some(source(c, &r.business_date, Some(p.category_run_ids[cat]))?)
+        } else {
+            None
+        };
+        let run = category_run.as_ref().unwrap_or(&run);
         let mut pool: Vec<Candidate> = run
             .candidates
             .iter()
@@ -434,34 +590,61 @@ pub fn generate_daily(c: &Connection, r: &GenerateRequest) -> Result<Vec<Coupon>
             }
             pool.truncate(7);
         } else if kind == "DAILY_COMPOUND" {
-            let pol = policy();
-            let mut best = None;
-            for n in 2..=pol.compound_max_legs {
-                for ids in combinations(&pool.iter().map(|x| x.id).collect::<Vec<_>>(), n) {
-                    let picks: Vec<Candidate> = ids
-                        .iter()
-                        .filter_map(|id| candidate_by_id(&pool, *id).cloned())
-                        .collect();
-                    let odd = combined(&picks);
-                    if odd >= pol.compound_odd_range[0]
-                        && odd <= pol.compound_odd_range[1]
-                        && best
-                            .as_ref()
-                            .map(|b: &(f64, Vec<Candidate>)| {
-                                picks.iter().map(|x| x.score).sum::<f64>() > b.0
-                            })
-                            .unwrap_or(true)
-                    {
-                        best = Some((picks.iter().map(|x| x.score).sum(), picks));
-                    }
-                }
-            }
-            pool = best.map(|x| x.1).unwrap_or_default();
+            let search = search_compound(&pool);
+            let ids = search.chosen.map(|x| x.candidate_ids).unwrap_or_default();
+            pool.retain(|x| ids.contains(&x.id));
             if pool.is_empty() {
                 continue;
             }
         } else {
+            if kind == "DAILY_HIGH_CONFIDENCE" {
+                pool.sort_by(|a, b| {
+                    b.public_probability
+                        .total_cmp(&a.public_probability)
+                        .then(a.id.cmp(&b.id))
+                });
+            }
             pool = safe(&pool);
+            if matches!(kind, "DAILY_OVER_25" | "DAILY_OVER_35") {
+                pool.truncate(5);
+            }
+            if matches!(kind, "DAILY_CORNERS" | "DAILY_BTTS") {
+                pool.truncate(7);
+            }
+            if kind == "DAILY_HIGH_CONFIDENCE" {
+                let mut odd = 1.0;
+                let mut take = pool.len();
+                for (i, pick) in pool.iter().enumerate() {
+                    odd *= pick.iddaa_odd;
+                    if i >= 4 && odd >= policy().high_confidence_target_odd {
+                        take = i + 1;
+                        break;
+                    }
+                }
+                pool.truncate(take);
+            }
+        }
+        if matches!(
+            kind,
+            "DAILY_CORNERS"
+                | "DAILY_OVER_25"
+                | "DAILY_OVER_35"
+                | "DAILY_BTTS"
+                | "DAILY_HIGH_CONFIDENCE"
+        ) && pool.len()
+            < if matches!(kind, "DAILY_OVER_25" | "DAILY_OVER_35") {
+                3
+            } else {
+                5
+            }
+        {
+            continue;
+        }
+        if validate_selection_set(kind, &pool).is_err() {
+            continue;
+        }
+        if pool.is_empty() {
+            continue;
         }
         let target = kind == "DAILY_HIGH_CONFIDENCE"
             && combined(&pool) >= policy().high_confidence_target_odd;
@@ -471,6 +654,7 @@ pub fn generate_daily(c: &Connection, r: &GenerateRequest) -> Result<Vec<Coupon>
             vec![]
         };
         let id = insert_coupon(c, &run, kind, &pool, &sizes, r.unit_stake_cents, target)?;
+        c.execute("UPDATE phase8_coupons SET metadata_json=json_set(metadata_json,'$.published',json('true')) WHERE id=?1",[id]).map_err(|e|e.to_string())?;
         out.push(get_coupon(c, id)?);
     }
     Ok(out)
@@ -729,6 +913,10 @@ pub fn update_draft(c: &Connection, r: &UpdateRequest) -> Result<Coupon, String>
 }
 
 pub fn finalize(c: &Connection, id: i64) -> Result<Coupon, String> {
+    let coupon = get_coupon(c, id)?;
+    if !rule_compliant(&coupon) {
+        return Err("COUPON_RULES_NOT_SATISFIED".into());
+    }
     let changed = c
         .execute(
             "UPDATE phase8_coupons SET status='FINALIZED' WHERE id=?1 AND status='DRAFT'",
@@ -756,7 +944,7 @@ pub fn get_coupon(c: &Connection, id: i64) -> Result<Coupon, String> {
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<i64>, _>>()
         .map_err(|e| e.to_string())?;
-    let mut q=c.prepare("SELECT candidate_id,match_id,competition_id,market,selection,line_value,raw_probability,public_probability,calibration_status,calibration_version,iddaa_odd,odds_snapshot_id,odds_captured_at,probability_edge,expected_value,score,rank,correlation_type,status FROM phase8_coupon_selections WHERE coupon_id=?1 ORDER BY selection_order").map_err(|e|e.to_string())?;
+    let mut q=c.prepare("SELECT candidate_id,match_id,competition_id,market,selection,line_value,raw_probability,public_probability,calibration_status,calibration_version,iddaa_odd,odds_snapshot_id,odds_captured_at,probability_edge,expected_value,score,rank,correlation_type,status,COALESCE((SELECT a.state FROM coupon_selection_settlement_audit a WHERE a.selection_id=phase8_coupon_selections.id),status),(SELECT a.reason FROM coupon_selection_settlement_audit a WHERE a.selection_id=phase8_coupon_selections.id) FROM phase8_coupon_selections WHERE coupon_id=?1 ORDER BY selection_order").map_err(|e|e.to_string())?;
     let selections = q
         .query_map([id], |x| {
             Ok(CouponSelectionSnapshot {
@@ -779,6 +967,8 @@ pub fn get_coupon(c: &Connection, id: i64) -> Result<Coupon, String> {
                 rank: x.get(16)?,
                 correlation_type: x.get(17)?,
                 status: x.get(18)?,
+                settlement_state: x.get(19)?,
+                settlement_reason: x.get(20)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -799,7 +989,8 @@ pub fn get_coupon(c: &Connection, id: i64) -> Result<Coupon, String> {
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
-    Ok(Coupon {
+    let mut coupon = Coupon {
+        publication_status: "DRAFT".into(),
         id,
         status: h.9,
         coupon_type: h.0,
@@ -823,7 +1014,29 @@ pub fn get_coupon(c: &Connection, id: i64) -> Result<Coupon, String> {
         unit_stake_cents: h.13,
         total_stake_cents: h.14,
         metadata: serde_json::from_str(&h.15).unwrap_or_default(),
-    })
+    };
+    coupon.publication_status = if coupon.coupon_type == "DAILY_COMPOUND"
+        && coupon.series_id.is_none()
+    {
+        "DRAFT"
+    } else if coupon.status == "SETTLED" {
+        "SETTLED"
+    } else if coupon.status == "CANCELLED" {
+        "DRAFT"
+    } else if !rule_compliant(&coupon) {
+        "INSUFFICIENT"
+    } else if (matches!(
+        coupon.policy_version.as_str(),
+        COUPON_POLICY_VERSION | "coupon_policy_v3_daily_goal_top7" | "coupon_policy_v2_minimums"
+    ) && coupon.metadata["published"] == true)
+        || coupon.status == "FINALIZED"
+    {
+        "READY"
+    } else {
+        "DRAFT"
+    }
+    .into();
+    Ok(coupon)
 }
 
 pub fn lineup_revision_impact(
@@ -846,13 +1059,18 @@ pub fn lineup_revision_impact(
             category: None,
         },
     )?;
-    let latest = candidate_engine::generate_lineup_revision(
-        c,
-        &candidate_engine::LineupRevisionGenerateRequest {
-            base_run_id,
-            business_date,
-        },
-    )?;
+    let has_lineup_data: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM prediction_revisions pr JOIN matches m ON m.id=pr.match_id WHERE m.scheduled_local_date=?1 AND pr.revision_type='LINEUP_AWARE_PREMATCH' AND pr.payload_schema=?2)", params![business_date, crate::repositories::lineup_model::REVISION_PAYLOAD_SCHEMA], |r| r.get(0)).map_err(|e| e.to_string())?;
+    let latest = if has_lineup_data {
+        candidate_engine::generate_lineup_revision(
+            c,
+            &candidate_engine::LineupRevisionGenerateRequest {
+                base_run_id,
+                business_date,
+            },
+        )?
+    } else {
+        base_run.clone()
+    };
     let mut q = c
         .prepare("SELECT id,candidate_id,match_id,market,selection,line_value,public_probability FROM phase8_coupon_selections WHERE coupon_id=?1 ORDER BY selection_order")
         .map_err(|e| e.to_string())?;
@@ -954,14 +1172,60 @@ pub fn lineup_revision_impact(
     })
 }
 
+pub fn rule_compliant(c: &Coupon) -> bool {
+    let n = c.selections.len();
+    let count = match c.coupon_type.as_str() {
+        "DAILY_CORNERS" => (5..=7).contains(&n),
+        "DAILY_OVER_25" | "DAILY_OVER_35" => {
+            if c.policy_version == COUPON_POLICY_VERSION {
+                (3..=5).contains(&n)
+            } else {
+                n >= 5
+            }
+        }
+        "DAILY_BTTS" | "DAILY_HIGH_CONFIDENCE" => n >= 5,
+        "DAILY_COMPOUND" => (2..=3).contains(&n),
+        "DAILY_SURPRISE_SYSTEM" => (6..=7).contains(&n),
+        _ => false,
+    };
+    count
+        && (c.coupon_type != "DAILY_COMPOUND"
+            || c.combined_decimal_odd
+                .is_some_and(|v| (1.50 - 1e-9..=1.80 + 1e-9).contains(&v)))
+        && c.selections
+            .iter()
+            .all(|s| s.odd.is_finite() && s.odd > 1.0)
+        && c.selections
+            .iter()
+            .map(|s| s.match_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == n
+}
 pub fn get_daily(c: &Connection, date: &str, kind: Option<&str>) -> Result<Vec<Coupon>, String> {
-    let mut q=c.prepare("SELECT id FROM phase8_coupons WHERE business_date=?1 AND (?2 IS NULL OR coupon_type=?2) ORDER BY id").map_err(|e|e.to_string())?;
+    let publication = match super::daily_selections::publication(c, date) {
+        Ok(value) => Some(value),
+        Err(e) if e == "no candidate run" => None,
+        Err(e) => return Err(e),
+    };
+    let base = publication.as_ref().map(|p| p.candidate_run_id);
+    let btts = publication.as_ref().map(|p| p.category_run_ids["BTTS_YES"]);
+    let mut q=c.prepare("SELECT id FROM phase8_coupons c WHERE business_date=?1 AND (?2 IS NULL OR coupon_type=?2) AND c.status<>'CANCELLED' AND EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=c.id) AND (c.coupon_type<>'DAILY_BTTS' OR c.source_candidate_run_id=?4) AND (c.status<>'DRAFT' OR c.series_id IS NOT NULL OR c.source_candidate_run_id=CASE WHEN c.coupon_type='DAILY_BTTS' THEN ?4 ELSE ?3 END) ORDER BY id DESC").map_err(|e|e.to_string())?;
     let ids = q
-        .query_map(params![date, kind], |x| x.get(0))
+        .query_map(params![date, kind, base, btts], |x| x.get(0))
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<i64>, _>>()
         .map_err(|e| e.to_string())?;
-    ids.into_iter().map(|id| get_coupon(c, id)).collect()
+    let values: Vec<Coupon> = ids
+        .into_iter()
+        .map(|id| get_coupon(c, id))
+        .collect::<Result<_, _>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    Ok(values
+        .into_iter()
+        .filter(|c| rule_compliant(c) && c.publication_status != "DRAFT")
+        .filter(|c| seen.insert(c.coupon_type.clone()))
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1055,6 +1319,17 @@ pub fn settle_series_result(
     if s.status != "ACTIVE" {
         return Ok(s);
     }
+    let Some(coupon_id) = s.latest_coupon_id else {
+        return Err("NO_SETTLED_STEP".into());
+    };
+    let actual: (i64,i64,i64,i64)=c.query_row("SELECT count(*),sum(status='WON'),sum(status='LOST'),sum(status='PENDING') FROM phase8_coupon_selections WHERE coupon_id=?1",[coupon_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(|e|e.to_string())?;
+    if actual.0 == 0
+        || (result == "WON" && (actual.1 == 0 || actual.2 > 0 || actual.3 > 0))
+        || (result == "LOST" && actual.2 == 0)
+        || (result == "VOID" && (actual.1 > 0 || actual.2 > 0 || actual.3 > 0))
+    {
+        return Err("SETTLEMENT_NOT_CONFIRMED".into());
+    }
     if let Some(coupon_id) = s.latest_coupon_id {
         let step_result: String = c.query_row("SELECT result FROM phase8_series_steps WHERE coupon_id=?1 ORDER BY id DESC LIMIT 1", [coupon_id], |x| x.get(0)).optional().map_err(|e| e.to_string())?.unwrap_or("UNSETTLED".into());
         if step_result != "UNSETTLED" {
@@ -1063,12 +1338,12 @@ pub fn settle_series_result(
     }
     if result == "WON" {
         if s.current_step >= 7 {
-            c.execute("UPDATE phase8_compound_series SET status='COMPLETED',completed_steps=7 WHERE id=?1",[id]).map_err(|e|e.to_string())?;
+            c.execute("UPDATE phase8_compound_series SET status='ACTIVE',current_step=1,completed_steps=0,current_stake_cents=starting_stake_cents,reset_count=reset_count+1,metadata_json=json_set(metadata_json,'$.last_reason','SEVEN_STEPS_COMPLETED','$.last_transition_at',strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1",[id]).map_err(|e|e.to_string())?;
         } else {
-            c.execute("UPDATE phase8_compound_series SET current_step=current_step+1,completed_steps=completed_steps+1,current_stake_cents=?2 WHERE id=?1",params![id,gross_return_cents]).map_err(|e|e.to_string())?;
+            c.execute("UPDATE phase8_compound_series SET current_step=current_step+1,completed_steps=completed_steps+1,current_stake_cents=?2,metadata_json=json_set(metadata_json,'$.last_reason','WON_ADVANCE','$.last_transition_at',strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1",params![id,gross_return_cents]).map_err(|e|e.to_string())?;
         }
     } else if result == "LOST" {
-        c.execute("UPDATE phase8_compound_series SET status='ACTIVE',current_step=1,current_stake_cents=starting_stake_cents,reset_count=reset_count+1 WHERE id=?1",[id]).map_err(|e|e.to_string())?;
+        c.execute("UPDATE phase8_compound_series SET status='ACTIVE',current_step=1,completed_steps=0,current_stake_cents=starting_stake_cents,reset_count=reset_count+1,metadata_json=json_set(metadata_json,'$.last_reason','LOSS_RESET','$.last_transition_at',strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1",[id]).map_err(|e|e.to_string())?;
     } else if result == "VOID" {
         // A fully void step is retried at the same step and stake.
         if let Some(coupon_id) = s.latest_coupon_id {
@@ -1081,7 +1356,16 @@ pub fn settle_series_result(
     if let Some(coupon_id) = s.latest_coupon_id {
         c.execute("UPDATE phase8_series_steps SET result=?2,settled_at=?3 WHERE coupon_id=?1 AND result='UNSETTLED'",params![coupon_id,result,chrono::Utc::now().to_rfc3339()]).map_err(|e|e.to_string())?;
     }
-    series(c, id)
+    let after = series(c, id)?;
+    let reason = if result == "LOST" {
+        "LOSS_RESET"
+    } else if s.current_step == 7 {
+        "SEVEN_STEPS_COMPLETED"
+    } else {
+        "WON_ADVANCE"
+    };
+    c.execute("INSERT OR IGNORE INTO compound_transition_audit(series_id,coupon_id,from_step,to_step,result,reason) VALUES(?1,?2,?3,?4,?5,?6)",params![id,coupon_id,s.current_step,after.current_step,result,reason]).map_err(|e|e.to_string())?;
+    Ok(after)
 }
 
 pub fn generate_compound_step(
@@ -1104,7 +1388,7 @@ pub fn generate_compound_step(
         return Err("SERIES_NOT_ACTIVE".into());
     }
     if let Some(existing) = c
-        .query_row("SELECT coupon_id FROM phase8_series_steps WHERE series_id=?1 AND step_number=?2 AND business_date=?3", params![s.id, s.current_step as i64, date], |x| x.get(0))
+        .query_row("SELECT coupon_id FROM phase8_series_steps WHERE series_id=?1 AND result='UNSETTLED' ORDER BY id DESC LIMIT 1", [s.id], |x| x.get(0))
         .optional()
         .map_err(|e| e.to_string())?
     {
@@ -1123,6 +1407,9 @@ pub fn generate_compound_step(
         .into_iter()
         .next()
         .ok_or("NO_QUALIFYING_COMPOUND_COUPON")?;
+    if coupon.series_id.is_some() {
+        return Err("SOURCE_RUN_ALREADY_USED_IN_SERIES".into());
+    }
     c.execute("UPDATE phase8_coupons SET series_id=?2,step_number=?3,unit_stake_cents=?4,total_stake_cents=?4 WHERE id=?1",params![coupon.id,s.id,s.current_step,s.current_stake_cents]).map_err(|e|e.to_string())?;
     let potential = payout(
         s.current_stake_cents,
@@ -1228,9 +1515,31 @@ pub fn settle(c: &Connection, r: &SettlementRequest) -> Result<SettlementResult,
         outcomes.insert(x.candidate_id, x.result.clone());
         c.execute(
             "UPDATE phase8_coupon_selections SET status=?2 WHERE coupon_id=?1 AND candidate_id=?3",
-            params![r.coupon_id, x.result, x.candidate_id],
+            params![
+                r.coupon_id,
+                if x.result == "UNSETTLED" {
+                    "PENDING"
+                } else {
+                    &x.result
+                },
+                x.candidate_id
+            ],
         )
         .map_err(|e| e.to_string())?;
+    }
+    outcomes = c
+        .prepare("SELECT candidate_id,status FROM phase8_coupon_selections WHERE coupon_id=?1")
+        .map_err(|e| e.to_string())?
+        .query_map([r.coupon_id], |x| {
+            Ok((x.get::<_, i64>(0)?, x.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
+        .map_err(|e| e.to_string())?;
+    for value in outcomes.values_mut() {
+        if value == "PENDING" {
+            *value = "UNSETTLED".into();
+        }
     }
     let mut q = c
         .prepare("SELECT candidate_id,iddaa_odd FROM phase8_coupon_selections WHERE coupon_id=?1")
@@ -1374,7 +1683,7 @@ pub fn settle(c: &Connection, r: &SettlementRequest) -> Result<SettlementResult,
         coupon_id: r.coupon_id,
         status: if unsettled > 0 {
             "UNSETTLED".into()
-        } else if losses > 0 && !is_system {
+        } else if losses > 0 && (!is_system || wins == 0) {
             "LOST".into()
         } else if wins > 0 {
             "WON".into()

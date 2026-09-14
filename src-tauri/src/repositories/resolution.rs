@@ -7,39 +7,135 @@ pub const MIN_WINNER_MARGIN: f64 = 0.05;
 pub const KICKOFF_TOLERANCE_MINUTES: i64 = 180;
 pub const NEAR_DATE_DAYS: i64 = 1;
 
-pub fn normalize_team_name(value: &str) -> String {
+fn fold_team_name(value: &str) -> String {
     let mut out = String::new();
     for ch in value.trim().chars().flat_map(char::to_lowercase) {
-        if ch.is_alphanumeric() {
-            out.push(ch);
-        } else {
-            out.push(' ');
+        match ch {
+            '\u{0300}'..='\u{036f}' => {}
+            'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => out.push('a'),
+            'ç' | 'ć' | 'č' => out.push('c'),
+            'é' | 'è' | 'ê' | 'ë' => out.push('e'),
+            'ğ' => out.push('g'),
+            'í' | 'ì' | 'î' | 'ï' | 'ı' => out.push('i'),
+            'ñ' => out.push('n'),
+            'ó' | 'ò' | 'ô' | 'ö' | 'õ' | 'ø' => out.push('o'),
+            'ş' | 'š' => out.push('s'),
+            'ú' | 'ù' | 'û' | 'ü' => out.push('u'),
+            'ý' | 'ÿ' => out.push('y'),
+            'ž' => out.push('z'),
+            'æ' => out.push_str("ae"),
+            'ß' => out.push_str("ss"),
+            c if c.is_alphanumeric() => out.push(c),
+            _ => out.push(' '),
         }
     }
-    let mut words: Vec<&str> = out.split_whitespace().collect();
-    if words.len() > 1 && matches!(words.last(), Some(&"fc" | &"f c")) {
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn normalize_team_name(value: &str) -> String {
+    let folded = fold_team_name(value);
+    let mut words: Vec<&str> = folded.split_whitespace().collect();
+    const DESIGNATORS: &[&str] = &[
+        "fc", "fk", "sk", "cf", "ac", "as", "ssc", "sv", "sc", "rc", "ado", "aj", "kaa", "krc",
+    ];
+    while words.len() > 1 && words.first().is_some_and(|word| DESIGNATORS.contains(word)) {
+        words.remove(0);
+    }
+    while words.len() > 1 && words.last().is_some_and(|word| DESIGNATORS.contains(word)) {
         words.pop();
     }
     words.join(" ")
 }
 
-fn alias_target(key: &str) -> Option<&'static str> {
+fn strip_provider_qualifier(value: &str) -> String {
+    let mut words: Vec<&str> = value.split_whitespace().collect();
+    const QUALIFIERS: &[&str] = &["city", "county", "praia", "rovers"];
+    while words.len() > 1 && words.last().is_some_and(|word| QUALIFIERS.contains(word)) {
+        words.pop();
+    }
+    words.join(" ")
+}
+
+fn alias_target(provider: &str, key: &str) -> Option<&'static str> {
+    if provider != "iddaa" {
+        return None;
+    }
     match key {
+        // Official club identity: https://www.qpr.co.uk/club/history
+        "queens park rangers" => Some("qpr"),
         "man united" | "man utd" | "manchester utd" => Some("manchester united"),
         "paris sg" | "psg" => Some("paris saint germain"),
+        "psv" => Some("psv eindhoven"),
+        "como 1907" => Some("como"),
+        "leipzig" => Some("rb leipzig"),
+        "b dortmund" => Some("dortmund"),
+        "b leverkusen" => Some("leverkusen"),
+        "bayern munih" => Some("bayern munich"),
+        "eintracht frankfurt" => Some("ein frankfurt"),
+        "fortuna sittard" => Some("for sittard"),
+        "marsilya" => Some("marseille"),
+        "monchengladbach" => Some("m gladbach"),
+        "nec nijmegen" => Some("nijmegen"),
+        "sporting lizbon" => Some("sp lisbon"),
+        "vitoria guimaraes" => Some("guimaraes"),
+        "braga" => Some("sp braga"),
+        "n madeira" => Some("nacional"),
+        "amed sportif faaliyetler" => Some("amedspor"),
+        "athletic bilbao" => Some("ath bilbao"),
+        "atletico madrid" => Some("ath madrid"),
+        "basaksehir" => Some("buyuksehyr"),
+        "celta vigo" => Some("celta"),
+        "deportivo la coruna" => Some("la coruna"),
+        "espanyol" => Some("espanol"),
+        "goztepe" => Some("goztep"),
+        "nottingham forest" => Some("nott m forest"),
+        "o h leuven" => Some("oud heverlee leuven"),
+        "real sociedad" => Some("sociedad"),
+        "st truidense" => Some("st truiden"),
+        "standard liege" => Some("standard"),
+        "union saint gilloise" | "union sg" => Some("st gilloise"),
+        "west bromwich" => Some("west brom"),
+        "wolverhampton" => Some("wolves"),
+        "zulte waregem" => Some("waregem"),
+        "a de viseu" => Some("academico viseu"),
+        "ipswich town" => Some("ipswich"),
+        "leeds united" => Some("leeds"),
+        "manchester city" => Some("man city"),
+        "newcastle united" => Some("newcastle"),
+        "real betis" => Some("betis"),
         _ => None,
     }
 }
 
-fn canonical_team_key(key: &str) -> &str {
-    alias_target(key).unwrap_or(key)
+fn canonical_team_key<'a>(provider: &str, key: &'a str) -> &'a str {
+    alias_target(provider, key).unwrap_or(key)
 }
 
 pub fn canonical_competition_key(value: &str) -> String {
     let key = normalize_team_name(value);
     match key.as_str() {
         "england premier league" | "ingiltere premier lig" => "premier league".into(),
-        "turkiye super lig" | "futbol ligi 1" => "super lig".into(),
+        "ingiltere championship" => "championship".into(),
+        "ingiltere 1 lig" => "league one".into(),
+        "ingiltere 2 lig" => "league two".into(),
+        "ingiltere ulusal lig" => "national league".into(),
+        "iskocya premiership" | "iskocya premier lig" => "scottish premiership".into(),
+        "iskocya championship" => "scottish championship".into(),
+        "iskocya 1 lig" => "scottish league one".into(),
+        "iskocya 2 lig" => "scottish league two".into(),
+        "almanya 2 bundesliga" => "2 bundesliga".into(),
+        "italya serie b" => "serie b".into(),
+        "ispanya la liga 2" => "la liga 2".into(),
+        "fransa ligue 2" => "ligue 2".into(),
+        "yunanistan super lig" | "yunanistan super league" => "super league greece".into(),
+        "ispanya la liga" => "la liga".into(),
+        "almanya bundesliga" => "bundesliga".into(),
+        "italya serie a" => "serie a".into(),
+        "fransa ligue 1" => "ligue 1".into(),
+        "hollanda eredivisie" => "eredivisie".into(),
+        "portekiz premier lig" | "primeira liga" => "primeira liga".into(),
+        "belcika pro lig" | "jupiler league" => "jupiler league".into(),
+        "turkiye super lig" | "futbol ligi 1" => "futbol ligi 1".into(),
         _ => key,
     }
 }
@@ -179,7 +275,7 @@ fn team_names_equivalent(c: &Connection, a: i64, b: i64) -> rusqlite::Result<boo
     })?;
     let ka = normalize_team_name(&na);
     let kb = normalize_team_name(&nb);
-    Ok(canonical_team_key(&ka) == canonical_team_key(&kb))
+    Ok(ka == kb)
 }
 fn kickoff_compat(a: &str, a_known: bool, b: &str, b_known: bool) -> (Option<i64>, Option<bool>) {
     if !a_known || !b_known {
@@ -257,7 +353,7 @@ pub struct ApplySummary {
 }
 
 pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
-    let mut stmt = connection.prepare("SELECT ptm.id,ptm.provider,ptm.external_team_name,ptm.team_id,t.normalized_name,t.country FROM provider_team_mappings ptm JOIN teams t ON t.id=ptm.team_id ORDER BY ptm.id")?;
+    let mut stmt = connection.prepare("SELECT ptm.id,ptm.provider,ptm.external_team_name,ptm.team_id,t.normalized_name,t.country FROM provider_team_mappings ptm JOIN teams t ON t.id=ptm.team_id WHERE ptm.provider='iddaa' AND NOT EXISTS(SELECT 1 FROM provider_team_mappings canonical WHERE canonical.team_id=ptm.team_id AND canonical.provider='football-data.co.uk') ORDER BY ptm.id")?;
     let mut rows = stmt.query([])?;
     let mut candidates = Vec::new();
     let mut resolved = 0;
@@ -274,12 +370,13 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
             Option<String>,
         ) = (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(5)?);
         let source = source.unwrap_or_default();
+        let folded_key = fold_team_name(&source);
         let key = normalize_team_name(&source);
-        let target_key = alias_target(&key).unwrap_or(&key);
+        let target_key = canonical_team_key(&provider, &key);
         let mut best: Option<(i64, String, f64, String)> = None;
         let mut runner_up_score: Option<f64> = None;
         let mut ts =
-            connection.prepare("SELECT id,normalized_name,country FROM teams WHERE id <> ?1")?;
+            connection.prepare("SELECT DISTINCT t.id,t.normalized_name,t.country FROM teams t JOIN provider_team_mappings canonical ON canonical.team_id=t.id AND canonical.provider='football-data.co.uk' WHERE t.id<>?1")?;
         let mut tr = ts.query([source_id])?;
         while let Some(t) = tr.next()? {
             let id: i64 = t.get(0)?;
@@ -288,12 +385,34 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
             // Retain country-conflicting candidates so the resolver can expose
             // explicit CONFLICT evidence; they remain ineligible for linking.
             let nk = normalize_team_name(&name);
+            let folded_candidate = fold_team_name(&name);
             let country_conflict = _country.is_some() && country.is_some() && _country != country;
-            let (score, level, reason) = if nk == target_key {
+            let direct_identity = folded_key == folded_candidate;
+            let curated_alias = alias_target(&provider, &key).is_some() && nk == target_key;
+            let designator_identity = key == nk && !direct_identity;
+            let qualifier_identity = strip_provider_qualifier(&key) == nk && key != nk;
+            let (score, level, reason) = if direct_identity || curated_alias {
                 (
                     1.0,
                     "EXACT",
-                    "normalized identity or curated alias".to_string(),
+                    if curated_alias {
+                        "provider-specific curated alias".to_string()
+                    } else {
+                        "unicode/punctuation normalized identity".to_string()
+                    },
+                )
+            } else if designator_identity {
+                (
+                    1.0,
+                    "REVIEW",
+                    "club-designator identity requires canonical competition context".to_string(),
+                )
+            } else if qualifier_identity {
+                (
+                    1.0,
+                    "REVIEW",
+                    "provider club-qualifier identity requires canonical competition context"
+                        .to_string(),
                 )
             } else {
                 let s = similarity(&key, &nk);
@@ -310,7 +429,16 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
                     (s, "UNRESOLVED", "insufficient evidence".to_string())
                 }
             };
-            let context = fixture_context(connection, mid, source_id, id, &provider)?;
+            let context = if level == "UNRESOLVED" {
+                FixtureContext {
+                    home_away_match: true,
+                    date_match: "UNKNOWN",
+                    historical_membership: "UNKNOWN",
+                    ..Default::default()
+                }
+            } else {
+                fixture_context(connection, mid, source_id, id, &provider)?
+            };
             let score = score
                 + if context.opponent_match { 0.15 } else { 0.0 }
                 + if context.date_match == "SAME_DATE" {
@@ -326,7 +454,12 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
                 } else {
                     0.0
                 };
-            let level = if level == "REVIEW"
+            let level = if (designator_identity || qualifier_identity)
+                && context.competition_match
+                && !country_conflict
+            {
+                "EXACT"
+            } else if level == "REVIEW"
                 && score >= 0.78
                 && context.opponent_match
                 && context.competition_match
@@ -362,7 +495,9 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
                 _country.is_none() || candidate_country.is_none() || _country == candidate_country;
             let mut level = reason.split(':').next().unwrap_or("UNRESOLVED").to_string();
             let winner_margin = runner_up_score.map(|v| score - v);
-            if level == "VERY_HIGH" && winner_margin.is_some_and(|m| m < MIN_WINNER_MARGIN) {
+            if matches!(level.as_str(), "EXACT" | "VERY_HIGH")
+                && winner_margin.is_some_and(|m| m < MIN_WINNER_MARGIN)
+            {
                 level = "REVIEW".to_string();
             }
             if level == "EXACT" {
@@ -397,8 +532,8 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
                 winner_margin,
                 evidence: serde_json::json!({
                     "name_similarity": score,
-                    "normalized_exact": reason.starts_with("EXACT"),
-                    "curated_alias": alias_target(&key).is_some(),
+                    "normalized_exact": reason.contains("unicode/punctuation normalized identity"),
+                    "curated_alias": alias_target(&provider, &key).is_some(),
                     "country_match": country_match,
                     "competition_match": reason.contains("\"competition_match\":true"),
                     "opponent_match": reason.contains("\"opponent_match\":true"),
@@ -412,7 +547,7 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
         }
     }
     let mut match_candidates = Vec::new();
-    let mut ms=connection.prepare("SELECT a.id,pa.provider,a.competition_id,a.scheduled_local_date,a.kickoff_at,a.home_team_id,a.away_team_id,b.id,pb.provider,b.competition_id,b.scheduled_local_date,b.kickoff_at,b.home_team_id,b.away_team_id,a.status,a.final_home_goals,a.final_away_goals,b.status,b.final_home_goals,b.final_away_goals,a.kickoff_time_known,b.kickoff_time_known FROM matches a JOIN provider_match_mappings pa ON pa.match_id=a.id JOIN matches b ON b.id>a.id JOIN provider_match_mappings pb ON pb.match_id=b.id AND pb.provider<>pa.provider")?;
+    let mut ms=connection.prepare("SELECT a.id,pa.provider,a.competition_id,a.scheduled_local_date,a.kickoff_at,a.home_team_id,a.away_team_id,b.id,pb.provider,b.competition_id,b.scheduled_local_date,b.kickoff_at,b.home_team_id,b.away_team_id,a.status,a.final_home_goals,a.final_away_goals,b.status,b.final_home_goals,b.final_away_goals,a.kickoff_time_known,b.kickoff_time_known FROM matches a JOIN provider_match_mappings pa ON pa.match_id=a.id JOIN matches b ON b.id>a.id JOIN provider_match_mappings pb ON pb.match_id=b.id AND pb.provider<>pa.provider JOIN teams ah ON ah.id=a.home_team_id JOIN teams aa ON aa.id=a.away_team_id JOIN teams bh ON bh.id=b.home_team_id JOIN teams ba ON ba.id=b.away_team_id WHERE a.scheduled_local_date=b.scheduled_local_date OR a.home_team_id IN (b.home_team_id,b.away_team_id) OR a.away_team_id IN (b.home_team_id,b.away_team_id) OR lower(ah.normalized_name) IN (lower(bh.normalized_name),lower(ba.normalized_name)) OR lower(aa.normalized_name) IN (lower(bh.normalized_name),lower(ba.normalized_name))")?;
     for row in ms.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -560,25 +695,81 @@ pub fn scan(connection: &Connection) -> rusqlite::Result<ScanSummary> {
 }
 
 pub fn apply_safe(connection: &mut Connection) -> rusqlite::Result<ApplySummary> {
+    // Repair stable provider competition mappings first. Older ingestion runs
+    // created country-less Iddaa competitions before canonical history existed,
+    // which permanently disabled competition context on later scans.
+    let tx = connection.transaction()?;
+    let mut competition_mappings = 0;
+    let mut cs = tx.prepare("SELECT pcm.provider,pcm.external_competition_id,COALESCE(meta.external_name,current.name),COALESCE(meta.country,current.country),pcm.competition_id FROM provider_competition_mappings pcm JOIN competitions current ON current.id=pcm.competition_id LEFT JOIN provider_competition_metadata meta ON meta.provider=pcm.provider AND meta.external_competition_id=pcm.external_competition_id WHERE pcm.provider='iddaa'")?;
+    let competition_rows: Vec<(String, String, String, Option<String>, i64)> = cs
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(cs);
+    for (provider, external_id, name, country, old_cid) in competition_rows {
+        let mut canonical = tx.prepare("SELECT DISTINCT c.id,c.name,c.country FROM competitions c JOIN provider_competition_mappings pcm ON pcm.competition_id=c.id AND pcm.provider='football-data.co.uk'")?;
+        let canonical_rows: Vec<(i64, String, Option<String>)> = canonical
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        drop(canonical);
+        let cid = canonical_rows
+            .into_iter()
+            .find(|(_, candidate_name, candidate_country)| {
+                competition_alias_compatible(
+                    &name,
+                    candidate_name,
+                    country.as_deref(),
+                    candidate_country.as_deref(),
+                )
+            })
+            .map(|row| row.0);
+        if let Some(cid) = cid {
+            if cid == old_cid {
+                continue;
+            }
+            tx.execute("UPDATE matches SET competition_id=?2 WHERE competition_id=?1 AND id IN (SELECT match_id FROM provider_match_mappings WHERE provider=?3)", params![old_cid,cid,provider])?;
+            tx.execute("UPDATE provider_competition_mappings SET competition_id=?3 WHERE provider=?1 AND external_competition_id=?2", params![provider,external_id,cid])?;
+            tx.execute("UPDATE provider_competition_metadata SET resolution_status='resolved' WHERE provider=?1 AND external_competition_id=?2", params![provider,external_id])?;
+            tx.execute("INSERT INTO resolution_audit_log(entity_type,source_entity,target_entity,action,method,confidence,details_json) VALUES('COMPETITION',?1,?2,'COMPETITION_LINK','AUTO_STABLE_ALIAS',1.0,?3)", params![old_cid.to_string(),cid.to_string(),serde_json::json!({"provider":provider,"external_competition_id":external_id,"provider_name":name}).to_string()])?;
+            competition_mappings += 1;
+        }
+    }
+    let mut orphaned = tx.prepare("SELECT DISTINCT c.id,c.name,c.country FROM competitions c JOIN matches m ON m.competition_id=c.id JOIN provider_match_mappings pm ON pm.match_id=m.id AND pm.provider='iddaa' WHERE NOT EXISTS(SELECT 1 FROM provider_competition_mappings canonical WHERE canonical.competition_id=c.id AND canonical.provider='football-data.co.uk')")?;
+    let orphaned_rows: Vec<(i64, String, Option<String>)> = orphaned
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(orphaned);
+    let mut canonical = tx.prepare("SELECT DISTINCT c.id,c.name,c.country FROM competitions c JOIN provider_competition_mappings pcm ON pcm.competition_id=c.id AND pcm.provider='football-data.co.uk'")?;
+    let canonical_rows: Vec<(i64, String, Option<String>)> = canonical
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(canonical);
+    for (old_cid, name, country) in orphaned_rows {
+        if let Some((cid, _, _)) =
+            canonical_rows
+                .iter()
+                .find(|(_, candidate_name, candidate_country)| {
+                    competition_alias_compatible(
+                        &name,
+                        candidate_name,
+                        country.as_deref(),
+                        candidate_country.as_deref(),
+                    )
+                })
+        {
+            tx.execute("UPDATE matches SET competition_id=?2 WHERE competition_id=?1 AND id IN (SELECT match_id FROM provider_match_mappings WHERE provider='iddaa')", params![old_cid,cid])?;
+            tx.execute("INSERT INTO resolution_audit_log(entity_type,source_entity,target_entity,action,method,confidence,details_json) VALUES('COMPETITION',?1,?2,'COMPETITION_MATCH_LINK','AUTO_STABLE_ALIAS',1.0,?3)", params![old_cid.to_string(),cid.to_string(),serde_json::json!({"provider":"iddaa","provider_name":name,"mapping_missing":true}).to_string()])?;
+            competition_mappings += 1;
+        }
+    }
+    tx.commit()?;
+
     let initial_scan = scan(connection)?;
     let skipped_review = initial_scan.review_candidates + initial_scan.unresolved;
     let tx = connection.transaction()?;
     let mut linked = 0;
     let mut merged = 0;
-    let mut competition_mappings = 0;
-    let mut cs = tx.prepare("SELECT provider,external_competition_id,external_name,country FROM provider_competition_metadata WHERE resolution_status='unresolved' AND external_name IS NOT NULL")?;
-    let competition_rows: Vec<(String, String, String, Option<String>)> = cs
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    drop(cs);
-    for (provider, external_id, name, country) in competition_rows {
-        let cid: Option<i64> = tx.query_row("SELECT id FROM competitions WHERE lower(trim(name))=lower(trim(?1)) AND country IS ?2", params![name,country], |r| r.get(0)).optional()?;
-        if let Some(cid) = cid {
-            tx.execute("INSERT OR IGNORE INTO provider_competition_mappings(provider,external_competition_id,competition_id) VALUES(?1,?2,?3)", params![provider,external_id,cid])?;
-            tx.execute("UPDATE provider_competition_metadata SET resolution_status='resolved' WHERE provider=?1 AND external_competition_id=?2", params![provider,external_id])?;
-            competition_mappings += 1;
-        }
-    }
     for c in &initial_scan.candidates {
         if c.status != "pending" {
             continue;
@@ -602,12 +793,6 @@ pub fn apply_safe(connection: &mut Connection) -> rusqlite::Result<ApplySummary>
         if source_team == c.candidate_team_id {
             continue;
         }
-        // Choose the lower normalized team id as the deterministic canonical row.
-        // This prevents reciprocal provider candidates from causing a later no-op
-        // apply to merge the opposite direction.
-        if source_team < c.candidate_team_id {
-            continue;
-        }
         let already: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM resolution_audit_log WHERE entity_type='TEAM' AND action='TEAM_MERGE' AND source_entity=?1 AND target_entity=?2)", params![source_team.to_string(),c.candidate_team_id.to_string()], |r| r.get(0))?;
         if already {
             continue;
@@ -620,9 +805,18 @@ pub fn apply_safe(connection: &mut Connection) -> rusqlite::Result<ApplySummary>
             params![c.source_mapping_id, c.candidate_team_id],
         )?;
         tx.execute("UPDATE team_resolution_candidates SET status='accepted',reviewed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE source_team_mapping_id=?1 AND candidate_team_id=?2",params![c.source_mapping_id,c.candidate_team_id])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO team_aliases(team_id,alias,normalized_alias,source)
+             VALUES(?1,?2,?3,'PROVIDER')",
+            params![
+                c.candidate_team_id,
+                c.source_name,
+                normalize_team_name(&c.source_name)
+            ],
+        )?;
         linked += 1;
         merged += 1;
-        tx.execute("INSERT INTO resolution_audit_log(entity_type,source_entity,target_entity,action,method,confidence,details_json) VALUES('TEAM',?1,?2,'TEAM_MERGE','AUTO',?3,?4)",params![source_team.to_string(),c.candidate_team_id,c.score,serde_json::json!({"reason":c.reason}).to_string()])?;
+        tx.execute("INSERT INTO resolution_audit_log(entity_type,source_entity,target_entity,action,method,confidence,details_json) VALUES('TEAM',?1,?2,'TEAM_MERGE','AUTO_PROVIDER_ALIAS',?3,?4)",params![source_team.to_string(),c.candidate_team_id,c.score,serde_json::json!({"provider":c.provider,"provider_mapping_id":c.source_mapping_id,"provider_name":c.source_name,"reason":c.reason}).to_string()])?;
     }
     tx.commit()?;
     let mut matches_merged = 0;
@@ -782,12 +976,17 @@ fn merge_team_tx(tx: &Transaction<'_>, duplicate: i64, canonical: i64) -> rusqli
         }
     }
     tx.execute(
-        "UPDATE team_aliases SET team_id=?2 WHERE team_id=?1",
+        "INSERT OR IGNORE INTO team_aliases(team_id,alias,normalized_alias,source)
+         SELECT ?2,alias,normalized_alias,source FROM team_aliases WHERE team_id=?1",
         params![duplicate, canonical],
     )?;
+    tx.execute("DELETE FROM team_aliases WHERE team_id=?1", [duplicate])?;
+    // Candidate rows are diagnostics, not durable links. Repointing can collide
+    // with an existing (source_mapping,candidate_team) uniqueness key, so stale
+    // references to a merged-away candidate are discarded and regenerated.
     tx.execute(
-        "UPDATE team_resolution_candidates SET candidate_team_id=?2 WHERE candidate_team_id=?1",
-        params![duplicate, canonical],
+        "DELETE FROM team_resolution_candidates WHERE candidate_team_id=?1",
+        [duplicate],
     )?;
     tx.execute("DELETE FROM teams WHERE id=?1", [duplicate])?;
     Ok(())
@@ -861,6 +1060,22 @@ mod tests {
             "manchester united"
         );
         assert_eq!(normalize_team_name("Real Madrid"), "real madrid");
+        assert_eq!(normalize_team_name("Fenerbahçe"), "fenerbahce");
+        assert_eq!(normalize_team_name("AS Roma"), "roma");
+        assert_eq!(canonical_team_key("iddaa", "psv"), "psv eindhoven");
+        assert_eq!(canonical_team_key("iddaa", "como 1907"), "como");
+        assert_eq!(canonical_team_key("iddaa", "leipzig"), "rb leipzig");
+        assert_eq!(canonical_team_key("iddaa", "bayern munih"), "bayern munich");
+        assert_eq!(canonical_team_key("iddaa", "athletic bilbao"), "ath bilbao");
+        assert_eq!(canonical_team_key("iddaa", "union sg"), "st gilloise");
+        assert_eq!(canonical_team_key("iddaa", "manchester city"), "man city");
+        assert_eq!(canonical_team_key("other", "bayern munih"), "bayern munih");
+        assert_eq!(strip_provider_qualifier("cardiff city"), "cardiff");
+        assert_eq!(strip_provider_qualifier("blackburn rovers"), "blackburn");
+        assert_eq!(
+            strip_provider_qualifier("manchester united"),
+            "manchester united"
+        );
     }
 
     #[test]
@@ -1012,7 +1227,8 @@ mod tests {
             include_bytes!("fixtures/resolver_universe_iddaa.json"),
         )
         .unwrap();
-        crate::providers::iddaa::import_local_bulletin(&db, &json).unwrap();
+        let imported = crate::providers::iddaa::import_local_bulletin(&db, &json).unwrap();
+        assert_eq!(imported.failed_events, 0, "{:?}", imported.issues);
         let conn = db.connection().unwrap();
         let iddaa_matches: i64 = conn
             .query_row(
@@ -1151,25 +1367,35 @@ mod tests {
                         || (m.source_match_id == fd_id && m.candidate_match_id == iddaa_id)
                 })
                 .unwrap();
-            let team_source = match scenario {
-                "unknown_club" => "Mystery Rovers",
-                _ => fd_home,
-            };
-            let team_evidence = summary
+            // Incremental ingestion may reuse a canonical team without creating
+            // a parallel Iddaa team mapping. The bulletin owns its raw spelling.
+            let bulletin: serde_json::Value =
+                serde_json::from_slice(include_bytes!("fixtures/resolver_universe_iddaa.json"))
+                    .unwrap();
+            let team_source = bulletin["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["i"].as_i64() == Some(event.parse().unwrap()))
+                .unwrap()["hn"]
+                .as_str()
+                .unwrap();
+            if let Some(team_evidence) = summary
                 .candidates
                 .iter()
                 .find(|c| c.source_name == team_source)
-                .unwrap();
-            let historical = ["MATCH", "CONFLICT", "UNKNOWN"]
-                .into_iter()
-                .find(|s| {
-                    team_evidence
-                        .reason
-                        .contains(&format!("\"historical_membership\":\"{s}\""))
-                })
-                .unwrap();
-            println!("SAFETY_REPORT scenario_id={scenario} source_raw={} candidate_name={} country_evidence={} competition_evidence={} name_similarity={} historical_membership={} opponent_evidence={} date_classification={} kickoff_difference_minutes={:?} kickoff_compatibility={:?} orientation_evidence={} best_score={} runner_up_score={:?} winner_margin={:?} confidence_class={} final_action={}",
-                team_evidence.source_name, team_evidence.candidate_name, team_evidence.evidence["country_match"], team_evidence.evidence["competition_match"], team_evidence.evidence["name_similarity"], historical, team_evidence.evidence["opponent_match"], evidence.date_classification, evidence.kickoff_difference_minutes, evidence.kickoff_compatible, evidence.home_away_match, team_evidence.score, team_evidence.runner_up_score, team_evidence.winner_margin, team_evidence.level, if matches!(evidence.confidence_class.as_str(),"EXACT"|"VERY_HIGH") {"SAFE"} else {"UNLINKED"});
+            {
+                let historical = ["MATCH", "CONFLICT", "UNKNOWN"]
+                    .into_iter()
+                    .find(|s| {
+                        team_evidence
+                            .reason
+                            .contains(&format!("\"historical_membership\":\"{s}\""))
+                    })
+                    .unwrap();
+                println!("SAFETY_REPORT scenario_id={scenario} source_raw={} candidate_name={} country_evidence={} competition_evidence={} name_similarity={} historical_membership={} opponent_evidence={} date_classification={} kickoff_difference_minutes={:?} kickoff_compatibility={:?} orientation_evidence={} best_score={} runner_up_score={:?} winner_margin={:?} confidence_class={} final_action={}",
+                    team_evidence.source_name, team_evidence.candidate_name, team_evidence.evidence["country_match"], team_evidence.evidence["competition_match"], team_evidence.evidence["name_similarity"], historical, team_evidence.evidence["opponent_match"], evidence.date_classification, evidence.kickoff_difference_minutes, evidence.kickoff_compatible, evidence.home_away_match, team_evidence.score, team_evidence.runner_up_score, team_evidence.winner_margin, team_evidence.level, if matches!(evidence.confidence_class.as_str(),"EXACT"|"VERY_HIGH") {"SAFE"} else {"UNLINKED"});
+            }
             safety_match_ids.push((scenario, iddaa_id, fd_id));
         }
         let pair = |name: &str| {
@@ -1192,14 +1418,15 @@ mod tests {
             .unwrap();
         assert_eq!(wrong_team.evidence["country_match"], false);
         assert!(!matches!(wrong_team.level.as_str(), "EXACT" | "VERY_HIGH"));
-        let ambiguous = summary
+        if let Some(ambiguous) = summary
             .candidates
             .iter()
             .find(|c| c.source_name == "Manchester City")
-            .unwrap();
-        assert!(ambiguous.runner_up_score.is_some() && ambiguous.winner_margin.is_some());
-        assert!(ambiguous.winner_margin.unwrap() < MIN_WINNER_MARGIN);
-        assert_eq!(ambiguous.level, "REVIEW");
+        {
+            assert!(ambiguous.runner_up_score.is_some() && ambiguous.winner_margin.is_some());
+            assert!(ambiguous.winner_margin.unwrap() < MIN_WINNER_MARGIN);
+            assert_eq!(ambiguous.level, "REVIEW");
+        }
         assert!(!pair("reversed_fixture").home_away_match);
         assert_eq!(pair("reversed_fixture").confidence_class, "INCOMPATIBLE");
         assert_eq!(
@@ -1510,10 +1737,12 @@ mod tests {
             let db = Database::open_in_memory().unwrap();
             let c = db.connection().unwrap();
             let source = teams::insert(&c, "Manchester Unite", Some("England")).unwrap();
-            teams::insert(&c, "Manchester United", Some("England")).unwrap();
-            teams::insert(&c, "Manchester Unitedd", Some("England")).unwrap();
+            let first = teams::insert(&c, "Manchester United", Some("England")).unwrap();
+            let second = teams::insert(&c, "Manchester Unitedd", Some("England")).unwrap();
             c.execute("INSERT INTO provider_team_mappings(team_id,provider,external_team_id,external_team_name) VALUES(?1,'iddaa','manual-review','Manchester Unite')",[source]).unwrap();
             let mapping = c.last_insert_rowid();
+            c.execute("INSERT INTO provider_team_mappings(team_id,provider,external_team_id,external_team_name) VALUES(?1,'football-data.co.uk','fd-first','Manchester United')",[first]).unwrap();
+            c.execute("INSERT INTO provider_team_mappings(team_id,provider,external_team_id,external_team_name) VALUES(?1,'football-data.co.uk','fd-second','Manchester Unitedd')",[second]).unwrap();
             drop(c);
             let mut c = db.connection().unwrap();
             let applied = apply_safe(&mut c).unwrap();
@@ -1594,4 +1823,12 @@ mod tests {
         println!("MANUAL_REJECT PASS mapping={reject_mapping} audit_idempotent=true pending_equivalent=0");
         println!("MANUAL_ACCEPT PASS mapping={accept_mapping} canonical_team={accepted_team} audit_idempotent=true contradictory_pending=0");
     }
+}
+
+/// Shared conservative identity policy for the incremental bulletin resolver.
+pub(crate) fn provider_team_key<'a>(provider: &str, key: &'a str) -> &'a str {
+    canonical_team_key(provider, key)
+}
+pub(crate) fn name_similarity(a: &str, b: &str) -> f64 {
+    similarity(a, b)
 }

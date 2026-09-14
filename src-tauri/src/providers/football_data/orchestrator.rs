@@ -64,6 +64,29 @@ pub(crate) async fn import_dataset(
     finish_acquired_import(database, dataset, &source_url, run_id, &acquired.bytes)
 }
 
+/// Production result refresh uses the existing public mirror only after the
+/// primary source fails. Its URL is persisted on the import run for provenance.
+pub(crate) async fn refresh_results(
+    database: &Database,
+    dataset: &DatasetDefinition,
+) -> Result<ImportSummary, String> {
+    match import_dataset(database, dataset).await {
+        Ok(summary) => Ok(summary),
+        Err(primary) => {
+            let url = dataset.mirror_url();
+            let run_id = start_run(database, dataset, &url)?;
+            let data = match download_csv(&url).await {
+                Ok(data) => data,
+                Err(error) => {
+                    mark_failed(database, run_id, &error.to_string());
+                    return Err(format!("Primary: {primary}; mirror: {error}"));
+                }
+            };
+            finish_acquired_import(database, dataset, &url, run_id, &data.bytes)
+        }
+    }
+}
+
 pub(crate) fn import_local_dataset(
     database: &Database,
     dataset: &DatasetDefinition,
@@ -149,7 +172,7 @@ fn finish_acquired_import(
     let result = (|| -> Result<(ImportSummary, i64), String> {
         let mut connection = database.connection()?;
         let mut transaction = connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let competition = ingestion::resolve_competition(
             &transaction,
@@ -263,6 +286,7 @@ fn finish_acquired_import(
             }
         }
         transaction.commit().map_err(|error| error.to_string())?;
+        crate::repositories::coupon_settlement::run(&connection)?;
         summary.duration_ms = started.elapsed().as_millis();
         ingestion::complete_import_run(
             &connection,

@@ -105,12 +105,16 @@ fn finish(
 
     let result = (|| -> Result<(), String> {
         let mut connection = database.connection()?;
-        let transaction = connection
-            .transaction()
+        // Reserve the writer before identity reads. The logo worker can otherwise
+        // invalidate a deferred read snapshot before its first popularity insert.
+        let mut transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         for (index, selection) in selections.iter().enumerate() {
-            match import_selection(&transaction, selection, index + 1, &captured_at) {
+            let savepoint = transaction.savepoint().map_err(|e| e.to_string())?;
+            match import_selection(&savepoint, selection, index + 1, &captured_at) {
                 Ok(outcome) => {
+                    savepoint.commit().map_err(|e| e.to_string())?;
                     summary.selections_imported += 1;
                     summary.matched_events += usize::from(outcome.matched);
                     summary.unmatched_events += usize::from(!outcome.matched);
@@ -125,6 +129,12 @@ fn finish(
                     });
                 }
             }
+        }
+        if summary.selections_seen > 0 && summary.selections_imported == 0 {
+            return Err(format!(
+                "POPULARITY_IMPORT_FAILED: {}",
+                serde_json::to_string(&summary.issues).unwrap_or_default()
+            ));
         }
         transaction.commit().map_err(|error| error.to_string())?;
         iddaa::complete_run(
@@ -186,6 +196,7 @@ fn import_selection(
     let market_type = normalize_market(raw.market_sub_type);
     let match_id = popularity::match_id_for_event(connection, &event_id_text)
         .map_err(|error| error.to_string())?;
+    connection.execute("INSERT OR IGNORE INTO popularity_selection_quotes(provider_event_id,provider_market_id,provider_selection_code,captured_at,odd,market_name) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params![event_id_text,market_id_text,selection_code_text,captured_at,raw.web_odd.or(raw.odd),raw.market_name]).map_err(|e|e.to_string())?;
 
     // Explicitly observed but not persisted as popularity: the public UI does not
     // document the denominator/unit of playedRatio, and odds are not popularity.

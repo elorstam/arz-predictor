@@ -6,6 +6,61 @@ use crate::database::Database;
 const DATE: &str = "2026-09-04";
 const CUTOFF: &str = "2026-09-04T12:00:00Z";
 
+#[test]
+fn latest_provider_list_drops_stale_rank_rows_and_distinguishes_invalid_odds() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    c.execute("INSERT INTO popularity_selection_quotes(provider_event_id,provider_market_id,provider_selection_code,captured_at,odd) VALUES('e1','m1','s1','2026-09-04T11:00:00Z',0.75),('e2','m2','s2','2026-09-04T11:00:00Z',2.0),('e6','m6','s6','2026-09-04T10:00:00Z',1.8)",[]).unwrap();
+    let response = subject::get(&c, &request(false)).unwrap();
+    assert_eq!(response.items.len(), 2);
+    assert_eq!(
+        response.items[0].support_status,
+        subject::SupportStatus::InvalidOdds
+    );
+    assert_eq!(response.items[0].reason.as_deref(), Some("INVALID_ODDS"));
+    assert_eq!(response.items[1].provider_event_id, "e2");
+}
+
+#[test]
+fn provider_identity_overrides_stale_snapshot_and_uses_exact_selection_odds() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    c.execute("INSERT INTO provider_match_mappings(provider,external_match_id,match_id) VALUES('iddaa','renamed-event',2)",[]).unwrap();
+    // Both teams already have canonical historical identities in this fixture.
+    c.execute("INSERT OR IGNORE INTO provider_team_mappings(provider,external_team_id,team_id) SELECT 'football-data.co.uk','canonical-'||id,id FROM teams",[]).unwrap();
+    c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,provider_market_id,provider_selection_code,captured_at) VALUES(2,'iddaa','provider-market','Unrelated display','new spelling',1.75,'TOTAL_GOALS','OVER',2.5,'id-market','id-outcome','2026-09-04T11:00:00Z')",[]).unwrap();
+    let odds = c.last_insert_rowid();
+    add_popular(
+        &c,
+        "renamed-event",
+        Some(1),
+        "id-market",
+        "id-outcome",
+        "UNKNOWN",
+        "bad text",
+        Some(9.5),
+        9999,
+        "9999",
+        1,
+        "2026-09-04T11:01:00Z",
+    );
+    let response = subject::get(&c, &request(false)).unwrap();
+    let row = response
+        .items
+        .iter()
+        .find(|r| r.provider_event_id == "renamed-event")
+        .unwrap();
+    assert_eq!(row.match_id, Some(2));
+    assert_eq!(row.market, "TOTAL_GOALS");
+    assert_eq!(row.selection, "OVER");
+    assert_eq!(row.line, Some(2.5));
+    assert_eq!(row.odds_snapshot_id, Some(odds));
+    assert_eq!(row.odds, Some(1.75));
+    assert_eq!(row.resolution_status, subject::ResolutionStatus::Resolved);
+    assert_eq!(row.model_probability, Some(0.6));
+    assert!((row.expected_value.unwrap() - 0.05).abs() < 1e-9);
+}
+
 fn add_popular(
     c: &Connection,
     event: &str,
@@ -72,10 +127,10 @@ fn add_prediction(
     c.execute(
         "INSERT INTO predictions(id,match_id,market,selection,line_value,model_probability,
          confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,
-         calibration_status,calibration_version,availability)
+         calibration_status,calibration_version,availability,created_at)
          VALUES(?1,?2,?3,?4,?5,?6,'MODEL_OUTPUT',
                 (SELECT kickoff_at FROM matches WHERE id=?2),1,?6,?6,
-                'CALIBRATED_V1','cal_v1','AVAILABLE')",
+                'CALIBRATED_V1','cal_v1','AVAILABLE','2026-09-04T11:00:00Z')",
         params![id, match_id, market, selection, line, probability],
     )
     .unwrap();
@@ -107,11 +162,11 @@ fn add_candidate(
          iddaa_odd,odds_snapshot_id,odds_captured_at,implied_probability,probability_edge,
          expected_value,data_quality,score,score_components_json,rank,same_match_group,
          correlation_type,compound_eligible,qualification_state,prediction_source,
-         lineup_revision_id,base_public_probability,final_public_probability,
+         lineup_revision_id,lineup_snapshot_id,base_public_probability,final_public_probability,
          lineup_model_version)
          VALUES(?1,2,?2,?3,1,?4,?5,?6,?7,?8,?8,'CALIBRATED_V1','cal_v1',
                 ?9,?10,?11,?12,?13,?14,'GOOD',?8,'{}',?15,CAST(?3 AS TEXT),
-                'NONE',0,'QUALIFIED',?16,?17,
+                'NONE',0,'QUALIFIED',?16,?17,?17,
                 (SELECT public_probability FROM predictions WHERE id=?2),?8,'lineup_v1')",
         params![
             id,
@@ -151,6 +206,7 @@ fn fixture() -> Database {
         [],
     )
     .unwrap();
+    c.execute("INSERT INTO provider_competition_mappings(provider,external_competition_id,competition_id) VALUES('football-data.co.uk','TEST',1)",[]).unwrap();
     for id in 1..=14 {
         c.execute(
             "INSERT INTO teams(id,normalized_name) VALUES(?1,?2)",
@@ -388,6 +444,16 @@ fn fixture() -> Database {
         8,
         "2026-09-04T10:00:00Z",
     );
+    // Daily consumers require a published, authoritative revision, not merely a newer run.
+    for (match_id, revision_id, prediction_id) in [(1, 901, 1), (5, 905, 5)] {
+        c.execute("INSERT INTO lineup_snapshots(id,match_id,provider,provider_event_id,captured_at,lineup_status,home_team_id,away_team_id,is_official,source_hash,completeness_status) SELECT ?2,id,'fixture-official',CAST(id AS TEXT),?3,'OFFICIAL',home_team_id,away_team_id,1,CAST(id AS TEXT),'COMPLETE_OFFICIAL' FROM matches WHERE id=?1",params![match_id,revision_id,CUTOFF]).unwrap();
+        c.execute("INSERT INTO prediction_revisions(id,prediction_id,match_id,revision_type,lineup_snapshot_id,generated_at,revision_reason,model_version,revision_status,payload_schema,lineup_model_hash) VALUES(?1,?2,?3,'LINEUP_AWARE_PREMATCH',?1,?4,'official fixture','model_v1','REVISION_AVAILABLE',?5,'fixture-model-hash')",params![revision_id,prediction_id,match_id,CUTOFF,super::lineup_model::REVISION_PAYLOAD_SCHEMA]).unwrap();
+    }
+    c.execute(
+        "INSERT INTO daily_output_publications(business_date,candidate_run_id) VALUES(?1,2)",
+        [DATE],
+    )
+    .unwrap();
     drop(c);
     db
 }
@@ -576,6 +642,58 @@ fn popularity_changes_and_duplicate_snapshots_do_not_change_model_outputs() {
 }
 
 #[test]
+fn stale_unresolved_rows_do_not_leak_into_another_business_date() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    let before = subject::get(&c, &request(false)).unwrap();
+    assert_eq!(before.unresolved_items, 1);
+
+    add_popular(
+        &c,
+        "stale-unresolved",
+        None,
+        "stale-market",
+        "stale-selection",
+        "MATCH_RESULT",
+        "1",
+        None,
+        9000,
+        "9.000+",
+        1,
+        "2026-09-03T10:00:00Z",
+    );
+
+    let after = subject::get(&c, &request(false)).unwrap();
+    assert_eq!(after.total_popular_items, before.total_popular_items);
+    assert_eq!(after.unresolved_items, before.unresolved_items);
+    assert!(after
+        .items
+        .iter()
+        .all(|item| item.source != "stale-unresolved"));
+}
+
+#[test]
+fn iddaa_local_match_without_historical_team_links_is_unresolved() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    c.execute("INSERT INTO provider_match_mappings(match_id,provider,external_match_id) VALUES(1,'iddaa','local-only')", []).unwrap();
+    c.execute("INSERT INTO provider_team_mappings(team_id,provider,external_team_id,external_team_name) VALUES(1,'iddaa','local-home','Team 1'),(2,'iddaa','local-away','Team 2')", []).unwrap();
+
+    let response = subject::get(&c, &request(false)).unwrap();
+    let item = response
+        .items
+        .iter()
+        .find(|item| item.match_id == Some(1))
+        .unwrap();
+    assert_eq!(
+        item.resolution_status,
+        subject::ResolutionStatus::Unresolved
+    );
+    assert_eq!(item.support_status, subject::SupportStatus::Unresolved);
+    assert_eq!(item.reason.as_deref(), Some("POPULAR_MATCH_UNRESOLVED"));
+}
+
+#[test]
 fn base_run_is_used_when_no_lineup_run_exists() {
     let db = Database::open_in_memory().unwrap();
     let c = db.connection().unwrap();
@@ -589,6 +707,7 @@ fn base_run_is_used_when_no_lineup_run_exists() {
     .unwrap();
     c.execute("INSERT INTO matches(id,competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(1,1,'2026/27',1,2,'2026-09-04T18:00:00Z','scheduled',?1,1)", [DATE]).unwrap();
     c.execute("INSERT INTO candidate_engine_runs(id,business_date,timezone,generated_at,model_version,candidate_policy_version,feature_engine_version,odds_cutoff_at,configuration_hash,input_fingerprint,status,match_count_considered,prediction_context) VALUES(1,?1,'Europe/Istanbul',?2,'model_v1',?3,'fe_v1',?2,'cfg','fp','COMPLETED',1,'BASE')", params![DATE,CUTOFF,candidate_engine::POLICY_VERSION]).unwrap();
+    c.execute("INSERT INTO provider_competition_mappings(provider,external_competition_id,competition_id) VALUES('football-data.co.uk','TEST',1)",[]).unwrap();
     add_prediction(&c, 1, 1, "MATCH_RESULT", "HOME", None, 0.8);
     c.execute("INSERT INTO candidate_engine_candidates(id,run_id,prediction_id,match_id,competition_id,category,market,selection,raw_probability,public_probability,calibration_status,iddaa_odd,odds_snapshot_id,odds_captured_at,implied_probability,probability_edge,expected_value,data_quality,score,score_components_json,rank,same_match_group,correlation_type,compound_eligible,qualification_state,prediction_source,base_public_probability,final_public_probability) VALUES(1,1,1,1,1,'HIGH_CONFIDENCE','MATCH_RESULT','HOME',.8,.8,'CALIBRATED_V1',1.5,1,?1,0.6666666666666666,0.1333333333333334,.2,'GOOD',.8,'{}',1,'1','NONE',0,'QUALIFIED','BASE',.8,.8)", [CUTOFF]).unwrap();
     add_popular(
@@ -605,6 +724,11 @@ fn base_run_is_used_when_no_lineup_run_exists() {
         1,
         CUTOFF,
     );
+    c.execute(
+        "INSERT INTO daily_output_publications(business_date,candidate_run_id) VALUES(?1,1)",
+        [DATE],
+    )
+    .unwrap();
     let response = subject::get(&c, &request(false)).unwrap();
     assert_eq!(response.prediction_context.as_deref(), Some("BASE"));
     assert_eq!(response.candidate_run_id, Some(1));

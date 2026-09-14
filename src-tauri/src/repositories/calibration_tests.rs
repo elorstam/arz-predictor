@@ -20,6 +20,43 @@ fn obs(p: f64, actual: bool) -> cal::BacktestObservation {
 }
 
 #[test]
+fn chronological_calibration_split_ignores_ids_and_keeps_fixture_ties_together() {
+    let mut rows = vec![];
+    for (id, date) in [
+        (90, "2025-01-01T00:00:00Z"),
+        (99, "2025-01-02T00:00:00Z"),
+        (1, "2025-01-03T00:00:00Z"),
+        (2, "2025-01-03T00:00:00Z"),
+        (3, "2025-01-04T00:00:00Z"),
+    ] {
+        let mut x = obs(0.6, true);
+        x.match_id = id;
+        x.cutoff = date.into();
+        rows.push(x.clone());
+        x.selection = "NO".into();
+        rows.push(x);
+    }
+    let report = cal::BacktestReport {
+        run_id: None,
+        model_version: "test".into(),
+        feature_engine_version: "fe_v1".into(),
+        fold_count: 1,
+        training_rows_by_fold: vec![],
+        oos_prediction_count: rows.len(),
+        evaluation_start: String::new(),
+        evaluation_end: String::new(),
+        out_of_sample: true,
+        markets: vec![],
+        confusion_matrix: Default::default(),
+        configuration: Default::default(),
+        result_hash: String::new(),
+        observations: rows,
+    };
+    let fit = cal::chronological_fit_matches(&report).unwrap();
+    assert_eq!(fit.into_iter().collect::<Vec<_>>(), vec![90, 99]);
+}
+
+#[test]
 fn migration_0010_and_oos_identity_are_present() {
     let db = Database::open_in_memory().unwrap();
     let c = db.connection().unwrap();
@@ -28,7 +65,7 @@ fn migration_0010_and_oos_identity_are_present() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 20);
+    assert_eq!(max, 32);
     for table in [
         "backtest_runs",
         "backtest_predictions",

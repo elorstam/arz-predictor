@@ -5,6 +5,62 @@ use crate::database::Database;
 
 const AS_OF: &str = "2026-01-31";
 
+#[test]
+fn pushed_filters_and_cached_snapshots_preserve_metrics_and_settlement_invalidation() {
+    let db = fixture();
+    let c = db.connection().unwrap();
+    let base: subject::ModelPerformanceRequest =
+        serde_json::from_value(serde_json::json!({"window":"ALL_TIME","asOf":AS_OF})).unwrap();
+    for window in ["LAST_7_DAYS", "LAST_30_DAYS", "ALL_TIME"] {
+        for market in [None, Some("BTTS"), Some("TOTAL_GOALS")] {
+            let r: subject::ModelPerformanceRequest = serde_json::from_value(
+                serde_json::json!({"window":window,"market":market,"asOf":AS_OF}),
+            )
+            .unwrap();
+            assert_eq!(
+                subject::get(&c, &r).unwrap(),
+                subject::get_with_base_request(&c, &r, &base).unwrap()
+            );
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("performance.sqlite3");
+    c.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let first = subject::cached(path.clone(), base.clone()).unwrap();
+    assert_eq!(first, subject::cached(path.clone(), base.clone()).unwrap());
+    let writer = Connection::open(&path).unwrap();
+    let epoch: i64 = writer
+        .query_row(
+            "SELECT version FROM model_performance_epoch WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    writer
+        .execute("UPDATE matches SET updated_at='2030-01-01' WHERE id=1", [])
+        .unwrap();
+    assert_eq!(
+        epoch,
+        writer
+            .query_row::<i64, _, _>(
+                "SELECT version FROM model_performance_epoch WHERE id=1",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap()
+    );
+    writer
+        .execute("UPDATE matches SET status='scheduled' WHERE id=1", [])
+        .unwrap();
+    let pending = subject::cached(path.clone(), base.clone()).unwrap();
+    assert!(pending.sample_count < first.sample_count);
+    writer
+        .execute("UPDATE matches SET status='finished' WHERE id=1", [])
+        .unwrap();
+    assert_eq!(first, subject::cached(path, base).unwrap());
+}
+
 fn add_match(
     c: &Connection,
     id: i64,

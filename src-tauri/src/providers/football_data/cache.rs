@@ -7,6 +7,14 @@ use std::{
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
+
+// Status/navigation may inspect the same CSV repeatedly. Hash its current bytes
+// each time, but parse an unchanged content hash only once per process.
+static VALIDATION_CACHE: OnceLock<Mutex<HashMap<String, Result<(), String>>>> = OnceLock::new();
 
 use super::{
     acquisition::{read_local_csv, AcquisitionError},
@@ -201,8 +209,23 @@ pub fn metadata(app_data_dir: &Path, dataset: &DatasetDefinition) -> Result<Cach
     let validation = read_local_csv(&path)
         .map_err(|error| error.to_string())
         .and_then(|bytes| {
-            validate_bytes(&bytes, dataset)?;
-            Ok(format!("{:x}", Sha256::digest(&bytes)))
+            let digest = format!("{:x}", Sha256::digest(&bytes));
+            let key = format!("{}:{digest}", dataset.key());
+            let cache = VALIDATION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+            let cached = cache.lock().map_err(|e| e.to_string())?.get(&key).cloned();
+            let validation = if let Some(value) = cached {
+                value
+            } else {
+                let value = validate_bytes(&bytes, dataset);
+                let mut entries = cache.lock().map_err(|e| e.to_string())?;
+                if entries.len() >= 128 {
+                    entries.clear();
+                }
+                entries.insert(key, value.clone());
+                value
+            };
+            validation?;
+            Ok(digest)
         });
     Ok(CacheMetadata {
         dataset: dataset.key(),

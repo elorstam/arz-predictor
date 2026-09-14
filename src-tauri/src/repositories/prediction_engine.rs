@@ -1125,7 +1125,7 @@ fn add_binary(
             line,
             selection: selection.into(),
             model_probability: Some(q),
-            raw_probability: Some(p),
+            raw_probability: Some(q),
             public_probability: Some(q),
             availability: "AVAILABLE".into(),
             source_model: source.into(),
@@ -1139,6 +1139,34 @@ fn add_binary(
         })
     }
 }
+#[test]
+fn binary_outcomes_are_complementary_in_every_probability_field() {
+    let mut markets = Vec::new();
+    add_binary(
+        &mut markets,
+        "TOTAL_GOALS",
+        Some(1.5),
+        "OVER",
+        "UNDER",
+        0.76,
+        "test",
+    );
+    assert!((markets[1].raw_probability.unwrap() - 0.24).abs() < 1e-12);
+    assert!(
+        (markets
+            .iter()
+            .map(|m| m.raw_probability.unwrap())
+            .sum::<f64>()
+            - 1.0)
+            .abs()
+            < 1e-12
+    );
+    for m in markets {
+        assert_eq!(m.raw_probability, m.model_probability);
+        assert_eq!(m.raw_probability, m.public_probability);
+    }
+}
+
 fn unavailable(out: &mut Vec<MarketPrediction>, market: &str, reason: &str) {
     out.push(MarketPrediction {
         market_type: market.into(),
@@ -1348,6 +1376,8 @@ pub fn persist_predictions(
     let run_hash = calibration_version
         .map(|version| format!("{}|calibration:{}", r.artifact_hash, version))
         .unwrap_or_else(|| r.artifact_hash.clone());
+    // Version the corrected outcome semantics without rewriting historical rows.
+    let run_hash = format!("{run_hash}|binary-outcome-v2|{}", hash(&r.markets)?);
     c.execute("INSERT OR IGNORE INTO prediction_runs(match_id,model_version_id,feature_engine_version,feature_schema_version,artifact_sha256,generated_at,base_home_lambda,base_away_lambda) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![r.match_id,model_id,r.feature_engine_version,r.feature_schema_version,run_hash,r.generated_at,r.base_home_lambda,r.base_away_lambda]).map_err(|e|e.to_string())?;
     let run:i64=c.query_row("SELECT id FROM prediction_runs WHERE match_id=?1 AND model_version_id=?2 AND artifact_sha256=?3",params![r.match_id,model_id,run_hash],|x|x.get(0)).map_err(|e|e.to_string())?;
     for p in r.markets.iter().filter(|p| p.model_probability.is_some()) {

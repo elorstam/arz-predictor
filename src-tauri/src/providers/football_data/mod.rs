@@ -6,6 +6,7 @@ mod catalog;
 mod normalization;
 mod orchestrator;
 mod parser;
+pub(crate) use catalog::all_datasets;
 
 pub use acquisition::NetworkDiagnostic;
 pub(crate) use bootstrap::bootstrap;
@@ -20,6 +21,7 @@ pub use cached_bootstrap::{
 };
 pub use catalog::{find_dataset, supported_datasets, DatasetDefinition, SupportedDataset};
 pub(crate) use orchestrator::import_dataset;
+pub(crate) use orchestrator::refresh_results;
 pub(crate) use orchestrator::{diagnose_dataset, import_local_dataset};
 pub use orchestrator::{ImportIssue, ImportSummary};
 

@@ -727,8 +727,14 @@ pub fn generate(c: &Connection, match_id: i64) -> Result<FeatureSnapshot, String
         home_matches_played_competition_season: home_played,
         away_matches_played_competition_season: away_played,
         data_quality: DataQuality {
-            history_matches_home: home_played,
-            history_matches_away: away_played,
+            history_matches_home: history
+                .iter()
+                .filter(|h| h.home == target.home || h.away == target.home)
+                .count(),
+            history_matches_away: history
+                .iter()
+                .filter(|h| h.home == target.away || h.away == target.away)
+                .count(),
             shots_coverage: cov(shots),
             corners_coverage: cov(corners_n),
             cards_coverage: cov(cards_n),

@@ -286,20 +286,31 @@ fn historical_odd(
     selection: &str,
     line: Option<f64>,
 ) -> Result<Option<f64>, String> {
-    c.query_row(
+    c.prepare_cached(
         "SELECT odd FROM odds_snapshots WHERE match_id=?1 AND captured_at<=?2
          AND UPPER(COALESCE(normalized_market_type,market_name))=UPPER(?3)
          AND UPPER(COALESCE(normalized_selection,selection))=UPPER(?4)
          AND (line_value IS ?5 OR line_value=?5)
          ORDER BY captured_at DESC,id DESC LIMIT 1",
-        params![match_id, cutoff, market, selection, line],
-        |row| row.get(0),
     )
+    .map_err(|e| e.to_string())?
+    .query_row(params![match_id, cutoff, market, selection, line], |row| {
+        row.get(0)
+    })
     .optional()
     .map_err(|e| e.to_string())
 }
 
-fn load_base(c: &Connection) -> Result<Vec<Observation>, String> {
+fn load_base(
+    c: &Connection,
+    request: &ModelPerformanceRequest,
+) -> Result<Vec<Observation>, String> {
+    let as_of = as_of_date(request)?;
+    let from = match request.window {
+        PerformanceWindow::Last7Days => Some((as_of - Duration::days(6)).to_string()),
+        PerformanceWindow::Last30Days => Some((as_of - Duration::days(29)).to_string()),
+        _ => None,
+    };
     let mut statement = c
         .prepare(
             "SELECT b.match_id,m.kickoff_at,m.season=competition.current_season,
@@ -315,35 +326,47 @@ fn load_base(c: &Connection) -> Result<Vec<Observation>, String> {
              JOIN competitions competition ON competition.id=m.competition_id
              LEFT JOIN match_statistics stats ON stats.match_id=m.id
              WHERE runs.status='COMPLETED' AND b.settlement IN ('WON','LOST')
+               AND date(m.kickoff_at,'+3 hours')<=?1
+               AND (?2 IS NULL OR date(m.kickoff_at,'+3 hours')>=?2)
+               AND (?3 IS NULL OR m.competition_id=?3)
+               AND (?4 IS NULL OR CASE WHEN b.market IN ('HOME_TEAM_TOTAL_GOALS','AWAY_TEAM_TOTAL_GOALS') THEN 'TEAM_TOTAL_GOALS' ELSE b.market END=?4)
                AND m.status='finished' AND m.final_home_goals IS NOT NULL
                AND m.final_away_goals IS NOT NULL
              ORDER BY m.kickoff_at,b.match_id,b.market,b.selection,b.id",
         )
         .map_err(|e| e.to_string())?;
     let raw = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? != 0,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<f64>>(7)?,
-                row.get::<_, f64>(8)?,
-                row.get::<_, String>(9)?,
-                row.get::<_, String>(10)?,
-                row.get::<_, String>(11)?,
-                row.get::<_, String>(12)?,
-                row.get::<_, Option<i64>>(13)?,
-                row.get::<_, Option<i64>>(14)?,
-                row.get::<_, Option<i64>>(15)?,
-                row.get::<_, Option<i64>>(16)?,
-                row.get::<_, Option<i64>>(17)?,
-                row.get::<_, Option<i64>>(18)?,
-            ))
-        })
+        .query_map(
+            params![
+                as_of.to_string(),
+                from,
+                request.competition_id,
+                request.market.as_deref().map(normalized_market)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<f64>>(7)?,
+                    row.get::<_, f64>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<i64>>(13)?,
+                    row.get::<_, Option<i64>>(14)?,
+                    row.get::<_, Option<i64>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<i64>>(17)?,
+                    row.get::<_, Option<i64>>(18)?,
+                ))
+            },
+        )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -1277,13 +1300,22 @@ pub fn get(
     c: &Connection,
     request: &ModelPerformanceRequest,
 ) -> Result<ModelPerformanceResponse, String> {
+    get_with_base_request(c, request, request)
+}
+pub(super) fn get_with_base_request(
+    c: &Connection,
+    request: &ModelPerformanceRequest,
+    base_request: &ModelPerformanceRequest,
+) -> Result<ModelPerformanceResponse, String> {
+    let started = std::time::Instant::now();
     let source = if request.candidate_only {
         load_candidates(c)?
     } else {
-        let mut rows = load_base(c)?;
+        let mut rows = load_base(c, base_request)?;
         rows.extend(load_lineup(c, false)?);
         rows
     };
+    let query_ms = started.elapsed().as_secs_f64() * 1000.0;
     let (rows, from, to) = filtered(source, request)?;
     let evaluated = evaluations(&rows, request.candidate_only);
     let comparisons = if request.candidate_only {
@@ -1310,7 +1342,7 @@ pub fn get(
             .then_with(|| a.prediction_context.cmp(&b.prediction_context))
             .then_with(|| a.market.cmp(&b.market))
     });
-    Ok(ModelPerformanceResponse {
+    let response = ModelPerformanceResponse {
         window: request.window,
         from_date: from.map(|date| date.to_string()),
         to_date: to.map(|date| date.to_string()),
@@ -1333,5 +1365,78 @@ pub fn get(
         by_model_version,
         candidate_policy_summary,
         base_vs_lineup: comparisons,
-    })
+    };
+    eprintln!(
+        "MODEL_PERFORMANCE query_ms={query_ms:.3} aggregation_ms={:.3}",
+        started.elapsed().as_secs_f64() * 1000.0 - query_ms
+    );
+    Ok(response)
+}
+
+pub fn cached(
+    path: std::path::PathBuf,
+    request: ModelPerformanceRequest,
+) -> Result<ModelPerformanceResponse, String> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<BTreeMap<String, (i64, ModelPerformanceResponse)>>> =
+        OnceLock::new();
+    let mut cache = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .map_err(|_| "PERFORMANCE_CACHE_LOCK")?;
+    let c = Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| e.to_string())?;
+    c.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
+    c.execute_batch("BEGIN").map_err(|e| e.to_string())?;
+    let version: i64 = c
+        .query_row(
+            "SELECT version FROM model_performance_epoch WHERE id=1",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    let key = format!(
+        "{}:{}:{}",
+        path.display(),
+        as_of_date(&request)?,
+        serde_json::to_string(&request).map_err(|e| e.to_string())?
+    );
+    if let Some((epoch, value)) = cache.get(&key) {
+        if *epoch == version {
+            return Ok(value.clone());
+        }
+    }
+    // A context filter is a no-op when the already-cached population contains
+    // only that context. Preserve all metric arrays and change only the filter DTO.
+    if let Some(context) = request.prediction_context {
+        let mut all = request.clone();
+        all.prediction_context = None;
+        let all_key = format!(
+            "{}:{}:{}",
+            path.display(),
+            as_of_date(&all)?,
+            serde_json::to_string(&all).map_err(|e| e.to_string())?
+        );
+        if let Some((epoch, value)) = cache.get(&all_key) {
+            if *epoch == version
+                && value
+                    .overall
+                    .iter()
+                    .all(|row| row.prediction_context == context)
+            {
+                let mut value = value.clone();
+                value.prediction_context = Some(context);
+                value.filters.prediction_context = Some(context);
+                cache.insert(key, (version, value.clone()));
+                return Ok(value);
+            }
+        }
+    }
+    let value = get(&c, &request)?;
+    if cache.len() >= 16 {
+        cache.clear();
+    }
+    cache.insert(key, (version, value.clone()));
+    Ok(value)
 }

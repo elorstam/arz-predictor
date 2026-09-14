@@ -34,7 +34,7 @@ pub(super) fn db() -> Database {
         } else {
             r#"{"history_matches_home":8,"history_matches_away":8,"corners_coverage":0.9}"#
         };
-        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,'fe_v1',?2,'{}',?3)", params![i + 1, GENERATION, quality]).unwrap();
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(?1,'fe_v1',?2,'{}',?3,'2026-09-02T10:00:00Z')", params![i + 1, GENERATION, quality]).unwrap();
     }
     // Every candidate below is a real persisted prediction DTO shape, including Phase 6.1 metadata.
     prediction(
@@ -403,7 +403,7 @@ fn prediction(
     n: Option<i64>,
     availability: &str,
 ) {
-    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_sample_size,bucket_observed_rate,availability) VALUES(?1,?2,?3,?4,?5,'acceptance',?6,1,?5,?5,?7,'cal_v1','0.8',?8,?5,?9)", params![match_id,market,selection,line,p,"2026-09-02T18:00:00Z",status,n,availability]).unwrap();
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,calibration_bucket,bucket_sample_size,bucket_observed_rate,availability,created_at) VALUES(?1,?2,?3,?4,?5,'acceptance',?6,1,?5,?5,?7,'cal_v1','0.8',?8,?5,?9,?10)", params![match_id,market,selection,line,p,"2026-09-02T18:00:00Z",status,n,availability,GENERATION]).unwrap();
 }
 fn odds(
     c: &Connection,
@@ -709,6 +709,7 @@ fn phase_7_controlled_acceptance_and_100_match_benchmark() {
         .unwrap();
         c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(1,'2026/27',?1,?2,'2026-09-03T18:00:00Z','scheduled','2026-09-03',1)",params![home,away]).unwrap();
         let id = 20 + i;
+        c.execute("INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) VALUES(?1,'fe_v1','2026-09-02T10:00:00Z','{}','{\"history_matches_home\":10,\"history_matches_away\":10}','2026-09-02T10:00:00Z')", [id]).unwrap();
         prediction(
             &c,
             id,

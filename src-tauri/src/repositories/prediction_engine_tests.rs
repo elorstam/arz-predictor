@@ -234,7 +234,7 @@ fn migration_0009_and_prediction_run_constraints_exist() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 20);
+    assert_eq!(max, 32);
     for table in ["prediction_runs"] {
         let n: i64 = c
             .query_row(

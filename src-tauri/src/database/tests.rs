@@ -254,7 +254,19 @@ fn migration_versions_are_tracked_and_not_reapplied() {
                 (17, "lineup_adjustment_model".to_string()),
                 (18, "prediction_base_lambdas".to_string()),
                 (19, "lineup_revision_core_payload".to_string()),
-                (20, "candidate_lineup_revision_lineage".to_string())
+                (20, "candidate_lineup_revision_lineage".to_string()),
+                (21, "daily_output_publications".to_string()),
+                (22, "iddaa_business_dates".to_string()),
+                (23, "asset_queue_and_series_audit".to_string()),
+                (24, "iddaa_corner_market".to_string()),
+                (25, "btts_daily_pipeline".to_string()),
+                (26, "logo_discovery".to_string()),
+                (27, "incremental_resolution".to_string()),
+                (28, "coupon_settlement_audit".to_string()),
+                (29, "popularity_selection_quotes".to_string()),
+                (30, "model_performance_cache".to_string()),
+                (31, "model_performance_invalidation".to_string()),
+                (32, "production_history_epoch".to_string())
             ]
         );
     }
@@ -268,7 +280,7 @@ fn migration_versions_are_tracked_and_not_reapplied() {
             row.get(0)
         })
         .expect("migration count should be readable");
-    assert_eq!(count, 20);
+    assert_eq!(count, 32);
 }
 
 #[test]
@@ -312,7 +324,10 @@ fn migration_0002_applies_after_existing_0001_database() {
         .expect("migration versions should decode");
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32
+        ]
     );
 }
 
@@ -361,7 +376,10 @@ fn migration_0003_applies_after_existing_0002_database() {
         .expect("migration versions should decode");
     assert_eq!(
         versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32
+        ]
     );
 
     super::migrations::apply_pending(&mut connection).expect("migration 0003 should not rerun");
@@ -370,7 +388,7 @@ fn migration_0003_applies_after_existing_0002_database() {
             row.get(0)
         })
         .expect("migration count should load");
-    assert_eq!(count, 20);
+    assert_eq!(count, 32);
 }
 
 #[test]
@@ -422,7 +440,7 @@ fn migration_0004_applies_after_existing_0003_database() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 20);
+    assert_eq!(count, 32);
     super::migrations::apply_pending(&mut connection).expect("migration should not rerun");
 }
 
@@ -472,7 +490,7 @@ fn migration_0005_applies_after_existing_0004_database() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(count, 20);
+    assert_eq!(count, 32);
     super::migrations::apply_pending(&mut connection).expect("migration should not rerun");
 }
 
@@ -497,7 +515,7 @@ fn migration_0007_applies_after_existing_0006_database() {
             .query_row::<i64, _, _>("SELECT MAX(version) FROM schema_migrations", [], |r| r
                 .get(0))
             .unwrap(),
-        20
+        32
     );
     for table in ["team_metadata", "competition_metadata", "entity_assets"] {
         assert_eq!(
@@ -535,7 +553,7 @@ fn migration_0008_applies_after_existing_0007_database() {
             .query_row::<i64, _, _>("SELECT MAX(version) FROM schema_migrations", [], |r| r
                 .get(0))
             .unwrap(),
-        20
+        32
     );
     for table in ["feature_sets", "training_labels"] {
         assert_eq!(

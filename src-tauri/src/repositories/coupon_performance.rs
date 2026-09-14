@@ -41,6 +41,8 @@ pub struct CouponFinancialSummary {
     pub roi: Option<f64>,
     pub average_stake_cents: Option<f64>,
     pub average_combined_odds: Option<f64>,
+    pub longest_winning_streak: usize,
+    pub longest_losing_streak: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -103,6 +105,9 @@ pub struct KatlamaSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CouponPerformanceResponse {
+    pub pending_data_selections: usize,
+    pub unpriced_coupons: usize,
+    pub pending_reasons: BTreeMap<String, usize>,
     pub window: PerformanceWindow,
     pub from_date: Option<String>,
     pub to_date: String,
@@ -194,6 +199,22 @@ fn summarize(rows: &[CouponRow]) -> CouponFinancialSummary {
         })
         .collect::<Vec<_>>();
     let won = outcomes.iter().filter(|x| **x == "WON").count();
+    let (mut win_streak, mut loss_streak, mut longest_win, mut longest_loss) = (0, 0, 0, 0);
+    for result in &outcomes {
+        match *result {
+            "WON" => {
+                win_streak += 1;
+                loss_streak = 0;
+                longest_win = longest_win.max(win_streak);
+            }
+            "LOST" => {
+                loss_streak += 1;
+                win_streak = 0;
+                longest_loss = longest_loss.max(loss_streak);
+            }
+            _ => {} // Refunds neither win nor lose.
+        }
+    }
     let lost = outcomes.iter().filter(|x| **x == "LOST").count();
     let voids = outcomes.iter().filter(|x| **x == "VOID").count();
     let stake: i64 = results.iter().map(|x| x.total_stake_cents).sum();
@@ -205,6 +226,8 @@ fn summarize(rows: &[CouponRow]) -> CouponFinancialSummary {
         .collect::<Vec<_>>();
     CouponFinancialSummary {
         coupon_count: rows.len(),
+        longest_winning_streak: longest_win,
+        longest_losing_streak: longest_loss,
         settled_count: results.len(),
         won_count: won,
         lost_count: lost,
@@ -393,7 +416,7 @@ pub fn get(
     let (from, to) = bounds(request.window, to);
     let include_system = request.include_system.unwrap_or(true);
     let include_katlama = request.include_katlama.unwrap_or(true);
-    let mut q=c.prepare("SELECT coupon_type,business_date,status,combined_decimal_odd,metadata_json FROM phase8_coupons WHERE status NOT IN ('DRAFT','CANCELLED') ORDER BY business_date,id").map_err(|e|e.to_string())?;
+    let mut q=c.prepare("SELECT coupon_type,business_date,status,combined_decimal_odd,metadata_json FROM phase8_coupons p WHERE status NOT IN ('DRAFT','CANCELLED') AND total_stake_cents IS NOT NULL AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') ORDER BY business_date,id").map_err(|e|e.to_string())?;
     let mut rows = q
         .query_map([], |r| {
             Ok((
@@ -457,7 +480,27 @@ pub fn get(
             .as_deref()
             .is_none_or(|x| x == "DAILY_COMPOUND");
     let system = wants_system.then(|| system_summary(&rows));
+    let mut pending_reasons = BTreeMap::new();
+    let mut pending=c.prepare("SELECT COALESCE(a.reason,'FINAL_RESULT_NOT_CHECKED'),count(*) FROM phase8_coupon_selections s JOIN phase8_coupons p ON p.id=s.coupon_id LEFT JOIN coupon_selection_settlement_audit a ON a.selection_id=s.id WHERE s.status='PENDING' AND p.status<>'CANCELLED' AND (json_extract(p.metadata_json,'$.published')=1 OR p.series_id IS NOT NULL OR p.status IN ('FINALIZED','SETTLED')) AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') AND p.business_date<=?1 AND (?2 IS NULL OR p.business_date>=?2) AND (?3 IS NULL OR p.coupon_type=?3) GROUP BY 1").map_err(|e|e.to_string())?;
+    for row in pending
+        .query_map(
+            rusqlite::params![
+                to.to_string(),
+                from.map(|d| d.to_string()),
+                request.coupon_type
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?)),
+        )
+        .map_err(|e| e.to_string())?
+    {
+        let (reason, n) = row.map_err(|e| e.to_string())?;
+        pending_reasons.insert(reason, n);
+    }
+    let unpriced_coupons=c.query_row("SELECT count(*) FROM phase8_coupons p WHERE total_stake_cents IS NULL AND status<>'CANCELLED' AND json_extract(metadata_json,'$.published')=1 AND business_date<=?1 AND (?2 IS NULL OR business_date>=?2) AND (?3 IS NULL OR coupon_type=?3) AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY')",rusqlite::params![to.to_string(),from.map(|d|d.to_string()),request.coupon_type],|r|r.get(0)).map_err(|e|e.to_string())?;
     Ok(CouponPerformanceResponse {
+        pending_data_selections: pending_reasons.values().sum(),
+        pending_reasons,
+        unpriced_coupons,
         window: request.window,
         from_date: from.map(|x| x.to_string()),
         to_date: to.to_string(),

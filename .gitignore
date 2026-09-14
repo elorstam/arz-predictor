@@ -31,3 +31,5 @@ tauri.release.local.conf.json
 *.sln
 *.sw?
 supabase/.temp/
+.tmp-dataflow/
+*.sqlite3
