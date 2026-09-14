@@ -1,9 +1,7 @@
 import { useState } from "react";
 import { useAsync } from "../hooks/useAsync";
 import { api } from "../services/tauri";
-import { businessDate, decimal, localDate, percent } from "../lib/format";
-import { StatusBadge } from "./StatusBadge";
-import type { Coupon, UpcomingMatch } from "../types";
+import { businessDate, localDate } from "../lib/format";
 
 export interface BttsAudit {
  business_date:string; as_of:string; stages:Record<string,number>;
@@ -13,18 +11,15 @@ export interface BttsAudit {
 const reasonLabels:Record<string,string>={NO_BTTS_PREDICTION:"KG Var/Yok tahmini yok",NO_BTTS_ODDS:"KG Var oranı yok",INVALID_ODDS:"Geçersiz oran",STALE_ODDS:"24 saatten eski oran",UNRESOLVED:"Eşleşme çözümlenmemiş",INSUFFICIENT_HISTORY:"Yetersiz geçmiş",POOR_MODEL_QUALITY:"Model çıktısı veya kalite sorunu",DUPLICATE:"Tekrarlanan maç",OTHER:"Başlamış/iptal maç veya diğer geçersiz girdi"};
 const stages:[string,string][]=[["prediction_ready","Tahmine hazır"],["btts_probability","KG Var olasılığı"],["calibrated_btts_probability","Kalibre olasılık"],["public_btts_fallback","Doğrulanmış model olasılığı"],["btts_odds","BTTS oranı"],["valid_yes_mapping","KG Var eşlemesi"],["invalid_input_survivors","Geçerli girdiler"],["ranking_pool","Sıralama havuzu"],["selected","Seçilen"]];
 
-export function BttsCouponCard({date,coupon,matches}:{date:string;coupon?:Coupon;matches:UpcomingMatch[]}) {
+export function BttsCouponDiagnostics({date}:{date:string}) {
  const state=useAsync(()=>api.bttsLatest(date),[date]);
  const [busy,setBusy]=useState(false),[error,setError]=useState("");
  async function refresh(){setBusy(true);setError("");try{await api.bttsRefresh(date);await state.reload();window.dispatchEvent(new Event("btts-updated"));}catch(e){setError(e instanceof Error?e.message:String(e));}finally{setBusy(false);}}
- const audit=state.data,ready=coupon?.publication_status==="READY"&&coupon.selections.length>=5&&coupon.selections.length<=7;
- return <section className={`panel coupon-card btts-card ${ready?"":"unavailable"}`}>
-  <div className="coupon-title"><div><span className="eyebrow">{date} · {ready?`${coupon.selections.length} SEÇİM`:"KG VAR AKIŞI"}</span><h2>Günün KG Var Kuponu</h2></div><StatusBadge value={ready?"READY":"INSUFFICIENT"}/></div>
+ const audit=state.data;
+ return <div className="btts-diagnostics">
   {date>=businessDate()&&<button className="button secondary" onClick={refresh} disabled={busy}>{busy?"KG Var yenileniyor…":"KG Var oranlarını ve kuponunu yenile"}</button>}
   {(error||state.error)&&<p role="alert">KG Var yenilenemedi: {error||state.error}</p>}
-  {ready&&<><div className="coupon-lines">{coupon.selections.map(s=>{const m=matches.find(x=>x.match_id===s.match_id);return <div className="coupon-line" key={s.candidate_id}><div><small>{m?.competition}</small><strong>{m?`${m.home_team} — ${m.away_team}`:`Maç #${s.match_id}`}</strong><span>KG Var</span></div><div><strong>{percent(s.public_probability,1)}</strong><span>{decimal(s.odd)}</span></div></div>})}</div><div className="coupon-footer"><div><span>Toplam oran</span><strong>{decimal(coupon.combined_decimal_odd)}</strong></div></div></>}
-  {!ready&&audit&&<p role="status">{audit.stages.ranking_pool>=5?`${audit.stages.ranking_pool} geçerli KG Var adayı var; kupon yayını yenilenmeli.`:`${audit.stages.ranking_pool} geçerli KG Var adayı / en az 5 gerekli. ${Object.entries(audit.primary_exclusions).map(([r,n])=>`${reasonLabels[r]??r}: ${n}`).join(" · ")}`}</p>}
   {state.loading&&!audit&&<p>KG Var akışı denetleniyor…</p>}
-  {audit&&<details className="details" open={!ready}><summary>KG Var aşama sayıları ve eleme nedenleri</summary><p>Veri kesiti: {localDate(audit.as_of,true)}</p><p>Olasılık → EV → güven → veri kalitesi. %64 ve pozitif EV eleme şartı uygulanmaz.</p>{stages.map(([key,label])=><div key={key}>{label}: <strong>{audit.stages[key]??0}</strong></div>)}<p>Her tahmine hazır maç için tek ana eleme nedeni:</p>{Object.entries(audit.primary_exclusions).map(([key,n])=><div key={key}>{reasonLabels[key]??key}: {n}</div>)}<details><summary>Maç bazında nedenler</summary>{audit.matches.filter(m=>m.prediction_ready&&m.primary_exclusion).map(m=><p key={m.match_id}>{m.home} — {m.away}: {reasonLabels[m.primary_exclusion!]??m.primary_exclusion}</p>)}</details></details>}
- </section>;
+  {audit&&<details className="details"><summary>KG Var aşama sayıları ve eleme nedenleri</summary><p>Veri kesiti: {localDate(audit.as_of,true)}</p><p>Olasılık → EV → güven → veri kalitesi. %64 ve pozitif EV eleme şartı uygulanmaz.</p>{stages.map(([key,label])=><div key={key}>{label}: <strong>{audit.stages[key]??0}</strong></div>)}<p>Her tahmine hazır maç için tek ana eleme nedeni:</p>{Object.entries(audit.primary_exclusions).map(([key,n])=><div key={key}>{reasonLabels[key]??key}: {n}</div>)}<details><summary>Maç bazında nedenler</summary>{audit.matches.filter(m=>m.prediction_ready&&m.primary_exclusion).map(m=><p key={m.match_id}>{m.home} — {m.away}: {reasonLabels[m.primary_exclusion!]??m.primary_exclusion}</p>)}</details></details>}
+ </div>;
 }

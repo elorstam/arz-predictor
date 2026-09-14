@@ -123,6 +123,7 @@ fn fingerprint(c: &rusqlite::Connection, date: &str) -> Result<String, String> {
         "SELECT json_array(version) FROM production_history_epoch WHERE id=1 AND ?1 IS NOT NULL",
         "SELECT json_array(id,version_identifier,is_active) FROM model_versions WHERE is_active=1 AND ?1 IS NOT NULL ORDER BY id",
         "SELECT json_array(id,calibration_version,is_active) FROM calibration_models WHERE is_active=1 AND ?1 IS NOT NULL ORDER BY id",
+        "SELECT json_array(s.id,s.status,s.current_step,s.reset_count,s.current_stake_cents,(SELECT MAX(t.id) FROM phase8_series_steps t WHERE t.series_id=s.id AND t.result<>'UNSETTLED')) FROM phase8_compound_series s WHERE ?1 IS NOT NULL ORDER BY s.id",
     ]{let mut q=c.prepare(sql).map_err(|e|e.to_string())?;let rows=q.query_map([date],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?;for row in rows{hash.update(row.map_err(|e|e.to_string())?);}}
     Ok(format!("{:x}", hash.finalize()))
 }
@@ -294,7 +295,17 @@ fn cycle(path: PathBuf, app: &tauri::AppHandle) -> Result<Value, String> {
         errors.push(e.clone());
     }
     timings.insert("popularity_ms".into(), json!(t.elapsed().as_millis()));
+    // Fetch due final results before deciding whether today's publication changed.
+    // The bounded result worker shares its persisted retry schedule with this cycle.
+    let t = Instant::now();
+    if let Err(error) = crate::settlement_scheduler::refresh_one(&db, app) {
+        errors.push(error);
+    }
+    timings.insert("result_ingestion_ms".into(), json!(t.elapsed().as_millis()));
     let c = db.connection()?;
+    let t = Instant::now();
+    let settled = coupon_settlement::run(&c)?;
+    timings.insert("settlement_ms".into(), json!(t.elapsed().as_millis()));
     let t = Instant::now();
     let resolution = incremental_resolution::process(&c, 128).map_err(|e| e.to_string())?;
     timings.insert("resolution_ms".into(), json!(t.elapsed().as_millis()));
@@ -340,9 +351,6 @@ fn cycle(path: PathBuf, app: &tauri::AppHandle) -> Result<Value, String> {
         "prediction_candidate_coupon_ms".into(),
         json!(t.elapsed().as_millis()),
     );
-    let t = Instant::now();
-    let settled = coupon_settlement::run(&c)?;
-    timings.insert("settlement_ms".into(), json!(t.elapsed().as_millis()));
     let t = Instant::now();
     let readiness = iddaa::bulletin_status(&c).map_err(|e| e.to_string())?;
     timings.insert("readiness_ms".into(), json!(t.elapsed().as_millis()));
@@ -442,6 +450,29 @@ pub fn start(path: PathBuf, app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn katlama_progression_invalidates_unchanged_live_inputs_once() {
+        let db = Database::open_in_memory().unwrap();
+        let c = db.connection().unwrap();
+        c.execute("INSERT INTO phase8_compound_series(business_date,status,current_step,starting_stake_cents,current_stake_cents,metadata_json) VALUES('2026-09-14','ACTIVE',1,10000,10000,'{}')", []).unwrap();
+        let before = fingerprint(&c, "2026-09-14").unwrap();
+        c.execute(
+            "UPDATE phase8_compound_series SET current_step=2,current_stake_cents=16900",
+            [],
+        )
+        .unwrap();
+        let won = fingerprint(&c, "2026-09-14").unwrap();
+        assert_ne!(before, won);
+        assert_eq!(won, fingerprint(&c, "2026-09-14").unwrap());
+        c.execute("UPDATE phase8_compound_series SET current_step=1,current_stake_cents=10000,reset_count=1", []).unwrap();
+        let lost = fingerprint(&c, "2026-09-14").unwrap();
+        assert_ne!(
+            before, lost,
+            "a step-1 loss must still invalidate publication"
+        );
+        assert_eq!(lost, fingerprint(&c, "2026-09-14").unwrap());
+    }
     #[test]
     fn frontend_ensure_waits_for_midnight_owner_without_requesting_another_run() {
         let mut s = Status {

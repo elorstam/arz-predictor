@@ -62,7 +62,8 @@ pub fn run(c: &Connection) -> Result<usize, String> {
 }
 
 fn process(c: &Connection) -> Result<usize, String> {
-    let mut q=c.prepare("SELECT s.id,s.coupon_id,s.match_id,s.market,s.selection,s.line_value FROM phase8_coupon_selections s JOIN phase8_coupons p ON p.id=s.coupon_id LEFT JOIN coupon_selection_settlement_audit a ON a.selection_id=s.id WHERE s.status='PENDING' AND p.status<>'CANCELLED' AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') AND (p.status IN ('FINALIZED','SETTLED') OR json_extract(p.metadata_json,'$.published')=1 OR p.series_id IS NOT NULL) ORDER BY COALESCE(a.checked_at,''),s.id LIMIT 256").map_err(|e|e.to_string())?;
+    // The active series must never sit behind the historical audit backlog.
+    let mut q=c.prepare("SELECT s.id,s.coupon_id,s.match_id,s.market,s.selection,s.line_value FROM phase8_coupon_selections s JOIN phase8_coupons p ON p.id=s.coupon_id LEFT JOIN coupon_selection_settlement_audit a ON a.selection_id=s.id WHERE s.status='PENDING' AND p.status<>'CANCELLED' AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') AND (p.status IN ('FINALIZED','SETTLED') OR json_extract(p.metadata_json,'$.published')=1 OR p.series_id IS NOT NULL) ORDER BY EXISTS(SELECT 1 FROM phase8_compound_series cs WHERE cs.latest_coupon_id=p.id AND cs.status='ACTIVE') DESC,COALESCE(a.checked_at,''),s.id LIMIT 256").map_err(|e|e.to_string())?;
     let rows = q
         .query_map([], |r| {
             Ok((
@@ -128,7 +129,7 @@ fn process(c: &Connection) -> Result<usize, String> {
         };
         c.execute("INSERT INTO coupon_selection_settlement_audit(selection_id,state,reason,result_match_id,checked_at) VALUES(?1,?2,?3,?4,strftime('%Y-%m-%dT%H:%M:%fZ','now')) ON CONFLICT(selection_id) DO UPDATE SET state=excluded.state,reason=excluded.reason,result_match_id=excluded.result_match_id,checked_at=excluded.checked_at",params![id,state,reason,source.map(|r|r.0)]).map_err(|e|e.to_string())?;
     }
-    let mut q=c.prepare("SELECT id,total_stake_cents FROM phase8_coupons p WHERE status IN ('DRAFT','FINALIZED') AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') AND (total_stake_cents IS NOT NULL OR json_extract(metadata_json,'$.settlement_pending_reason') IS NULL) AND (json_extract(metadata_json,'$.published')=1 OR series_id IS NOT NULL OR status='FINALIZED') AND EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=p.id) AND NOT EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=p.id AND s.status='PENDING') ORDER BY id LIMIT 64").map_err(|e|e.to_string())?;
+    let mut q=c.prepare("SELECT id,total_stake_cents FROM phase8_coupons p WHERE status IN ('DRAFT','FINALIZED') AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') AND (total_stake_cents IS NOT NULL OR json_extract(metadata_json,'$.settlement_pending_reason') IS NULL) AND (json_extract(metadata_json,'$.published')=1 OR series_id IS NOT NULL OR status='FINALIZED') AND EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=p.id) AND NOT EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=p.id AND s.status='PENDING') ORDER BY EXISTS(SELECT 1 FROM phase8_compound_series cs WHERE cs.latest_coupon_id=p.id AND cs.status='ACTIVE') DESC,id LIMIT 64").map_err(|e|e.to_string())?;
     let coupons = q
         .query_map([], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))

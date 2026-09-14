@@ -937,6 +937,14 @@ fn exclusion(p: &P, date: &str, cat: &str, reason: &str, generated: &str) -> Exc
 
 fn state_fingerprint(c: &Connection, ps: &[P], cutoff: &str) -> Result<String, String> {
     let mut state = String::new();
+    // A settled Katlama step needs a fresh immutable coupon even when odds are unchanged.
+    let mut series = c.prepare("SELECT json_array(s.id,s.status,s.current_step,s.reset_count,s.current_stake_cents,(SELECT MAX(t.id) FROM phase8_series_steps t WHERE t.series_id=s.id AND t.result<>'UNSETTLED')) FROM phase8_compound_series s ORDER BY s.id").map_err(|e| e.to_string())?;
+    for row in series
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| e.to_string())?
+    {
+        state.push_str(&row.map_err(|e| e.to_string())?);
+    }
     for p in ps {
         state.push_str(&format!(
             "{}|{}|{}|{}|{:?}|{}|{}|{};",
@@ -1218,6 +1226,9 @@ pub fn generate_daily_output(c: &Connection, r: &GenerateRequest) -> Result<Dail
             unit_stake_cents: None,
         },
     )?;
+    if r.generation_time.is_none() && run.business_date == crate::business_clock::date() {
+        super::coupon_engine::publish_active_compound(&tx, &run.business_date, run.run_id)?;
+    }
     tx.commit().map_err(|e| e.to_string())?;
     Ok(run)
 }

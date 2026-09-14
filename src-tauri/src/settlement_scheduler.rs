@@ -24,8 +24,13 @@ pub fn start(path: PathBuf, app: tauri::AppHandle) {
 
 // One due league per minute; each league is retried at most once per 15 minutes.
 // Fetch only seasons containing past, unsettled production selections.
-fn refresh_one(db: &crate::database::Database, app: &tauri::AppHandle) -> Result<(), String> {
+pub(crate) fn refresh_one(
+    db: &crate::database::Database,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
     use rusqlite::{params, OptionalExtension};
+    static RESULT_REFRESH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = RESULT_REFRESH.lock().map_err(|_| "RESULT_REFRESH_LOCK")?;
     let job = {
         let c = db.connection()?;
         let job:Option<(String,String)>=c.query_row("WITH needed AS (SELECT DISTINCT cp.external_competition_id league,printf('%02d%02d',(CAST(strftime('%Y',m.kickoff_at) AS INTEGER)-CASE WHEN CAST(strftime('%m',m.kickoff_at) AS INTEGER)<7 THEN 1 ELSE 0 END)%100,(CAST(strftime('%Y',m.kickoff_at) AS INTEGER)+CASE WHEN CAST(strftime('%m',m.kickoff_at) AS INTEGER)>=7 THEN 1 ELSE 0 END)%100) season FROM phase8_coupon_selections s JOIN phase8_coupons p ON p.id=s.coupon_id JOIN matches m ON m.id=s.match_id JOIN provider_competition_mappings cp ON cp.competition_id=m.competition_id AND cp.provider='football-data.co.uk' WHERE s.status='PENDING' AND p.status<>'CANCELLED' AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=p.source_candidate_run_id AND e.purpose='REPLAY') AND (p.status IN ('FINALIZED','SETTLED') OR json_extract(p.metadata_json,'$.published')=1 OR p.series_id IS NOT NULL) AND m.kickoff_at<strftime('%Y-%m-%dT%H:%M:%SZ','now','-3 hours')) SELECT n.league,n.season FROM needed n LEFT JOIN coupon_result_refresh r ON r.league_code=n.league AND r.season_code=n.season WHERE r.next_retry_at IS NULL OR r.next_retry_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now') ORDER BY COALESCE(r.last_attempt_at,''),n.league LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;

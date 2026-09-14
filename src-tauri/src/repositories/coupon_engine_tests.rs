@@ -6,6 +6,122 @@ fn fixture() -> Database {
     fixture_with_odd(2.60)
 }
 
+// A real persisted coupon from yesterday, with today's independent, eligible selections.
+fn katlama_live_fixture(no_combo: bool, step: i64) -> (Database, i64) {
+    let db = fixture_with_odd(1.30);
+    let c = db.connection().unwrap();
+    let run = phase7_run(&c);
+    c.execute("UPDATE candidate_run_execution SET purpose='LIVE'", [])
+        .unwrap();
+    let series = coupon_engine::start_series(&c, &run.business_date, 10000).unwrap();
+    c.execute("UPDATE phase8_compound_series SET current_step=?1", [step])
+        .unwrap();
+    let coupon =
+        coupon_engine::generate_compound_step(&c, &run.business_date, Some(run.run_id)).unwrap();
+    let today = crate::business_clock::date();
+    let now = chrono::Utc::now();
+    let cutoff = (now - chrono::Duration::minutes(10)).to_rfc3339();
+    let kickoff = (now + chrono::Duration::minutes(45)).to_rfc3339();
+    c.execute("UPDATE matches SET scheduled_local_date=?1,kickoff_at=?2 WHERE id NOT IN (SELECT match_id FROM phase8_coupon_selections WHERE coupon_id=?3)", params![today,kickoff,coupon.id]).unwrap();
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) SELECT match_id,market,selection,line_value,model_probability,confidence_bucket,?1,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,?2 FROM predictions",params![kickoff,cutoff]).unwrap();
+    c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT match_id,provider,market_code,market_name,selection,?1,normalized_market_type,normalized_selection,line_value,?2 FROM odds_snapshots",params![if no_combo {2.6} else {1.3},cutoff]).unwrap();
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources/production/base-model.json");
+    c.execute(
+        "UPDATE model_versions SET artifact_path=?1",
+        [artifact.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(c);
+    (db, series.id)
+}
+
+#[test]
+fn katlama_known_results_publish_next_step_in_the_same_flow_and_reopen_once() {
+    for (outcome, no_combo, step, expected) in [
+        ("WON", false, 1, 2),
+        ("LOST", false, 1, 1),
+        ("WON", true, 1, 2),
+        ("PENDING", false, 1, 1),
+        ("WON", false, 7, 1),
+    ] {
+        let (db, series_id) = katlama_live_fixture(no_combo, step);
+        let c = db.connection().unwrap();
+        let previous = coupon_engine::series(&c, series_id)
+            .unwrap()
+            .latest_coupon_id
+            .unwrap();
+        if outcome != "PENDING" {
+            c.execute("UPDATE matches SET status='finished',final_home_goals=?1,final_away_goals=1 WHERE id IN (SELECT match_id FROM phase8_coupon_selections WHERE coupon_id=?2)",params![if outcome=="LOST" {0} else {2},previous]).unwrap();
+        }
+        super::coupon_settlement::run(&c).unwrap();
+        let flow = super::current_flow::run(&c).unwrap();
+        let value = coupon_engine::series(&c, series_id).unwrap();
+        assert_eq!(
+            value.current_step, expected,
+            "{outcome}, no_combo={no_combo}"
+        );
+        assert_eq!(
+            value.history[0].result,
+            if outcome == "PENDING" {
+                "UNSETTLED"
+            } else {
+                outcome
+            }
+        );
+        let next_expected = outcome != "PENDING" && !no_combo;
+        assert_eq!(
+            value.history.len(),
+            if next_expected { 2 } else { 1 },
+            "{outcome}, no_combo={no_combo}; {flow:?}"
+        );
+        if next_expected {
+            let next = coupon_engine::get_daily(
+                &c,
+                &crate::business_clock::date(),
+                Some("DAILY_COMPOUND"),
+            )
+            .unwrap();
+            assert_eq!(next.len(), 1);
+            assert_eq!(next[0].publication_status, "READY");
+            assert_eq!(next[0].step_number, Some(expected));
+            assert!((2..=3).contains(&next[0].selections.len()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reopen.sqlite3");
+        c.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let reopened = Database::open(path).unwrap();
+        let rc = reopened.connection().unwrap();
+        super::coupon_settlement::run(&rc).unwrap();
+        super::current_flow::run(&rc).unwrap();
+        assert_eq!(
+            coupon_engine::series(&rc, series_id).unwrap(),
+            value,
+            "restart {outcome}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "controlled real desktop fixture export; set ARZ_KATLAMA_ACCEPTANCE_DIR"]
+fn export_katlama_desktop_scenarios() {
+    let root = std::path::PathBuf::from(std::env::var("ARZ_KATLAMA_ACCEPTANCE_DIR").unwrap());
+    for case in ["win", "loss", "pending", "no-combo"] {
+        let (db, _) = katlama_live_fixture(case == "no-combo", 1);
+        let dir = root.join(case);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("football-predictor.sqlite3");
+        assert!(!path.exists());
+        db.connection()
+            .unwrap()
+            .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        // Explicit acceptance fixture, not a zero-to-ready test. No runtime bypass of settlement.
+        std::fs::write(dir.join("first-run-bootstrap.json"),serde_json::json!({"version":crate::first_run::BOOTSTRAP_VERSION,"completed":[],"reports":{},"durations_ms":{},"started_at":"2026-09-14T00:00:00Z","completed_at":"2026-09-14T00:00:00Z","attempts":1,"error":null}).to_string()).unwrap();
+    }
+}
+
 #[test]
 fn automatic_coupon_outcome_without_stake_never_invents_realized_money() {
     let db = fixture();

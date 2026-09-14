@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useAsync } from "../hooks/useAsync";
 import { api } from "../services/tauri";
 import type { CapabilityReadiness, SubsystemReadiness } from "../types";
-import { localDate, readinessLabel } from "../lib/format";
+import { localDate } from "../lib/format";
 import { DataState } from "../components/States";
 import { PageHeader } from "../components/Page";
 import { StatusBadge } from "../components/StatusBadge";

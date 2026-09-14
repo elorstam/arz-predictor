@@ -1368,6 +1368,19 @@ pub fn settle_series_result(
     Ok(after)
 }
 
+/// Attach today's valid draft to an existing active series within the publication transaction.
+/// No stake or series is invented; unresolved steps retain their immutable coupon.
+pub fn publish_active_compound(c: &Connection, date: &str, run_id: i64) -> Result<(), String> {
+    if !series_status(c)?.is_some_and(|s| s.status == "ACTIVE") {
+        return Ok(());
+    }
+    match generate_compound_step(c, date, Some(run_id)) {
+        Ok(_) => Ok(()),
+        Err(error) if error == "NO_QUALIFYING_COMPOUND_COUPON" => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn generate_compound_step(
     c: &Connection,
     date: &str,
