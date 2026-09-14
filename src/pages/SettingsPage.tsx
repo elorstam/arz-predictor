@@ -42,6 +42,7 @@ export function SettingsPage({ license, onLicense }: { license: LicenseStatus; o
     <AutomaticRefresh settings/><PageHeader eyebrow="YEREL TERCİHLER" title="Ayarlar" description="Görünüm, başlangıç ve lisans tercihleri bu cihazda tutulur." />
     <div className="settings-grid">
       <Section title="Lisans">
+        {license.source === "DEV_BYPASS" && <div className="dev-license-notice"><strong>DEV LICENSE</strong><span>Yalnızca yerel debug geliştirme derlemesi.</span></div>}
         <div className="license-summary">
           <div><span>Durum</span><strong>{licenseLabel(license.state)}</strong></div>
           <div><span>Paket</span><strong>{planLabel(license.plan)}</strong></div>
@@ -49,12 +50,13 @@ export function SettingsPage({ license, onLicense }: { license: LicenseStatus; o
           <div><span>Bitiş tarihi</span><strong>{license.plan === "LIFETIME" ? "Ömür boyu" : license.expires_at ? new Date(license.expires_at).toLocaleDateString("tr-TR") : "—"}</strong></div>
           <div><span>Kalan süre</span><strong>{license.plan === "LIFETIME" ? "Sınırsız" : days === null ? "—" : `${days} gün`}</strong></div>
           <div><span>Son doğrulama</span><strong>{license.last_verified_at ? new Date(license.last_verified_at).toLocaleString("tr-TR") : "Henüz yok"}</strong></div>
+          <div><span>Kaynak</span><strong>{license.source === "DEV_BYPASS" ? "DEV_BYPASS" : license.source ?? "—"}</strong></div>
         </div>
-        <div className="license-actions">
+        {license.source !== "DEV_BYPASS" && <div className="license-actions">
           <input value={key} onChange={event => setKey(event.target.value)} placeholder="ARZP-XXXX-XXXX-XXXX-XXXX" aria-label="Lisans anahtarı" autoComplete="off" />
           <button className="button" onClick={activate} disabled={busy || !key.trim()}>Aktivasyonu Yap</button>
           <button className="button secondary" onClick={verify} disabled={busy}>Lisansı doğrula</button>
-        </div>
+        </div>}
         {license.device_bound && <small className="license-bound">Bu lisans bu cihaza bağlıdır.</small>}
         {license.state === "OFFLINE_GRACE" && <small className="license-bound">Çevrimdışı tolerans süresi kullanılıyor.</small>}
         {error && <div className="license-error">{error}</div>}

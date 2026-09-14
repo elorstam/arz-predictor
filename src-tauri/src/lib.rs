@@ -4,10 +4,13 @@ mod business_clock;
 mod commands;
 mod daily_pipeline;
 mod database;
+mod first_run;
 pub mod licensing;
 mod logo_discovery;
 pub mod models;
 pub mod providers;
+#[cfg(test)]
+mod release_asset_builder;
 pub mod repositories;
 mod settlement_scheduler;
 
@@ -21,12 +24,31 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_data_dir = app.path().app_data_dir()?;
+            #[cfg(debug_assertions)]
+            let app_data_dir = std::env::var_os("ARZ_DEV_APP_DATA_DIR")
+                .filter(|value| !value.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or(app_data_dir);
             let database =
                 database::Database::open(app_data_dir.join("football-predictor.sqlite3"))?;
             let asset_manager =
                 assets::AssetSyncManager::new(database.path().to_path_buf(), app_data_dir);
             asset_manager.start_scheduler();
             app.manage(asset_manager);
+            let resource_dir = app.path().resource_dir()?.join("production");
+            #[cfg(debug_assertions)]
+            let resource_dir = if resource_dir.is_dir() {
+                resource_dir
+            } else {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("resources")
+                    .join("production")
+            };
+            first_run::start(
+                database.path().to_path_buf(),
+                resource_dir,
+                app.handle().clone(),
+            );
             automatic_refresh::start(database.path().to_path_buf(), app.handle().clone());
             settlement_scheduler::start(database.path().to_path_buf(), app.handle().clone());
             app.manage(database);
@@ -39,6 +61,7 @@ pub fn run() {
             commands::model_performance_revision,
             commands::automatic_refresh_request,
             commands::automatic_refresh_configure,
+            commands::first_run_bootstrap_status,
             commands::license_status,
             commands::license_activate,
             commands::license_verify,

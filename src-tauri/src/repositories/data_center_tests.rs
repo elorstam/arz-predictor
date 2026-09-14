@@ -268,7 +268,7 @@ fn core_score_is_ten_required_checks_and_every_blocker_drops_ready() {
 }
 
 #[test]
-fn resolution_blocks_future_supported_only_and_optional_work_is_independent() {
+fn unresolved_events_outside_model_universe_are_nonblocking_and_optional_work_is_independent() {
     use data_center::ReadinessState as S;
     let db = Database::open_in_memory().unwrap();
     let c = db.connection().unwrap();
@@ -290,8 +290,8 @@ fn resolution_blocks_future_supported_only_and_optional_work_is_independent() {
     }
     let a = data_center::status(&c, &Default::default(), now(4)).unwrap();
     assert_eq!(a.entity_resolution.metrics["unresolved_count"], 3);
-    assert_eq!(a.entity_resolution.metrics["blocking_unresolved"], 1);
-    assert_eq!(a.entity_resolution.status, S::ActionRequired);
+    assert_eq!(a.entity_resolution.metrics["blocking_unresolved"], 0);
+    assert_eq!(a.entity_resolution.status, S::Ready);
     c.execute("UPDATE matches SET status='cancelled' WHERE id=4", [])
         .unwrap();
     let historical_only = data_center::status(&c, &Default::default(), now(4)).unwrap();

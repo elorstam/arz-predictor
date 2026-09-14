@@ -82,6 +82,11 @@ pub(crate) async fn refresh_results(
                     return Err(format!("Primary: {primary}; mirror: {error}"));
                 }
             };
+            let app_data_dir = database
+                .path()
+                .parent()
+                .ok_or_else(|| "database path has no application-data parent".to_string())?;
+            cache::store_validated_bytes(app_data_dir, dataset, &data.bytes)?;
             finish_acquired_import(database, dataset, &url, run_id, &data.bytes)
         }
     }

@@ -27,6 +27,9 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "resources/production/*": "production/"
+    },
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
     "publisher": "ARZ",

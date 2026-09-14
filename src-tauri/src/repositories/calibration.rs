@@ -1077,6 +1077,30 @@ pub fn persist_calibration(
     persist_calibration_model(c, report, base)
 }
 
+pub fn register_artifact(
+    c: &Connection,
+    path: &Path,
+    base: &pe::ArtifactFile,
+) -> Result<i64, String> {
+    let artifact = load_calibration(path)?;
+    if artifact.parent_model_version != base.bundle.model_version
+        || artifact.parent_artifact_sha256 != base.artifact_sha256
+        || artifact.feature_engine_version != base.bundle.feature_engine_version
+        || artifact.feature_schema_version != base.bundle.feature_schema_version
+    {
+        return Err("CALIBRATION_PARENT_MISMATCH".into());
+    }
+    let report = CalibrationReport {
+        artifact_path: path.to_string_lossy().into_owned(),
+        artifact_sha256: artifact.artifact_sha256.clone(),
+        methods_fitted: artifact.parameters.keys().cloned().collect(),
+        skipped: BTreeMap::new(),
+        raw_metrics: artifact.raw_metrics.clone(),
+        calibrated_metrics: artifact.calibrated_metrics.clone(),
+    };
+    persist_calibration_model(c, &report, base)
+}
+
 pub fn load_backtest_report(c: &Connection, run_id: i64) -> Result<BacktestReport, String> {
     let model_version: String = c
         .query_row(

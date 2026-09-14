@@ -50,6 +50,15 @@ fn due(status: &Status, now: i64, date: &str, pending: bool) -> bool {
         || (status.settings.enabled
             && (status.next_check.is_none_or(|next| now >= next) || status.business_date != date))
 }
+fn scheduler_due(
+    status: &Status,
+    now: i64,
+    date: &str,
+    pending: bool,
+    bootstrap_ready: bool,
+) -> bool {
+    bootstrap_ready && due(status, now, date, pending)
+}
 pub fn status() -> Result<Status, String> {
     Ok(CONTROL
         .get()
@@ -381,7 +390,13 @@ pub fn start(path: PathBuf, app: tauri::AppHandle) {
         let date = crate::business_clock::date();
         let run = {
             let mut c = CONTROL.get().unwrap().lock().unwrap();
-            if due(&c.status, now, &date, c.pending) {
+            if scheduler_due(
+                &c.status,
+                now,
+                &date,
+                c.pending,
+                crate::first_run::daily_refresh_allowed(),
+            ) {
                 c.pending = false;
                 c.status.state = "RUNNING".into();
                 c.status.last_started = Some(now);
@@ -483,6 +498,24 @@ mod tests {
         assert!(!due(&status, 1000, "2026-09-14", pending));
         status.state = "IDLE".into();
         assert!(!due(&status, 1000, "2026-09-14", pending));
+    }
+
+    #[test]
+    fn bootstrap_gate_precedes_daily_scheduler() {
+        assert!(!scheduler_due(
+            &Status::default(),
+            1000,
+            "2026-09-14",
+            true,
+            false
+        ));
+        assert!(scheduler_due(
+            &Status::default(),
+            1000,
+            "2026-09-14",
+            true,
+            true
+        ));
     }
     #[test]
     fn unchanged_input_does_not_require_a_new_publication() {

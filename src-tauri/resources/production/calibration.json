@@ -1,0 +1,218 @@
+{
+  "calibration_schema_version": "calibration_v1",
+  "calibration_version": "arz-base-1.0.2-cal1",
+  "parent_model_version": "arz-base-1.0.2",
+  "parent_artifact_sha256": "478231a19905e29f36ed69bee174e813a33f4f476bb0f5901005209b417cf177",
+  "feature_engine_version": "fe_v1",
+  "feature_schema_version": "pred_features_v1",
+  "fitted_from": "2024-11-09T15:00:00Z",
+  "fitted_to": "2025-09-21T15:30:00Z",
+  "parameters": {
+    "BTTS": {
+      "method": "PLATT_LOGISTIC",
+      "a": 0.05,
+      "b": 6.931324201466625e-18,
+      "temperature": null,
+      "sample_count": 660,
+      "status": "CALIBRATION_NOT_BENEFICIAL"
+    },
+    "MATCH_RESULT": {
+      "method": "TEMPERATURE_SCALING",
+      "a": 1.0,
+      "b": 0.0,
+      "temperature": 2.0,
+      "sample_count": 330,
+      "status": "CALIBRATED_V1"
+    },
+    "TEAM_CORNERS": {
+      "method": "PLATT_LOGISTIC",
+      "a": 0.12633368597605205,
+      "b": -6.8080569146215674e-12,
+      "temperature": null,
+      "sample_count": 5280,
+      "status": "CALIBRATION_NOT_BENEFICIAL"
+    },
+    "TEAM_TOTAL_GOALS": {
+      "method": "PLATT_LOGISTIC",
+      "a": 0.24431852055476905,
+      "b": -4.315802951757798e-13,
+      "temperature": null,
+      "sample_count": 2640,
+      "status": "CALIBRATION_NOT_BENEFICIAL"
+    },
+    "TOTAL_CARDS": {
+      "method": "PLATT_LOGISTIC",
+      "a": 0.34962127262194254,
+      "b": -1.2619324777060385e-19,
+      "temperature": null,
+      "sample_count": 3300,
+      "status": "CALIBRATION_NOT_BENEFICIAL"
+    },
+    "TOTAL_CORNERS": {
+      "method": "PLATT_LOGISTIC",
+      "a": 0.10346349755572118,
+      "b": 1.0678326909576497e-18,
+      "temperature": null,
+      "sample_count": 3300,
+      "status": "CALIBRATION_NOT_BENEFICIAL"
+    },
+    "TOTAL_GOALS": {
+      "method": "PLATT_LOGISTIC",
+      "a": 0.11543621909099472,
+      "b": -4.383712925488063e-12,
+      "temperature": null,
+      "sample_count": 1980,
+      "status": "CALIBRATION_NOT_BENEFICIAL"
+    }
+  },
+  "raw_metrics": {
+    "BTTS": {
+      "sample_count": 660,
+      "log_loss": 0.6724419373967039,
+      "brier": 0.2399867494389236,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.05535167471422081,
+      "mce": 0.1629468155750866,
+      "accuracy": null
+    },
+    "TEAM_CORNERS": {
+      "sample_count": 5280,
+      "log_loss": 0.6496703327579959,
+      "brier": 0.2226042801781177,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.07806540464904468,
+      "mce": 0.13442516656642067,
+      "accuracy": null
+    },
+    "TEAM_TOTAL_GOALS": {
+      "sample_count": 2640,
+      "log_loss": 0.6072742485968884,
+      "brier": 0.2087348184890518,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.03628626174944037,
+      "mce": 0.11898540429002992,
+      "accuracy": null
+    },
+    "TOTAL_CARDS": {
+      "sample_count": 3300,
+      "log_loss": 0.5667867122492274,
+      "brier": 0.190436959332836,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.05250729861570652,
+      "mce": 0.08533392928274852,
+      "accuracy": null
+    },
+    "TOTAL_CORNERS": {
+      "sample_count": 3300,
+      "log_loss": 0.6630948752275839,
+      "brier": 0.2330998903769348,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.05925849683260929,
+      "mce": 0.22383791653913132,
+      "accuracy": null
+    },
+    "TOTAL_GOALS": {
+      "sample_count": 1980,
+      "log_loss": 0.5976708476087823,
+      "brier": 0.2051114738681463,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.03372295496947153,
+      "mce": 0.07412695089243382,
+      "accuracy": null
+    }
+  },
+  "calibrated_metrics": {
+    "BTTS": {
+      "sample_count": 660,
+      "log_loss": 0.6913753377098478,
+      "brier": 0.24911417032897212,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.035894002718082324,
+      "mce": 0.03589400271808235,
+      "accuracy": null
+    },
+    "TEAM_CORNERS": {
+      "sample_count": 5280,
+      "log_loss": 0.6626539723241351,
+      "brier": 0.23486772569859057,
+      "mean_prediction": 0.4999999999983136,
+      "observed_hit_rate": 0.5,
+      "ece": 0.12226579328855593,
+      "mce": 0.26469753942233387,
+      "accuracy": null
+    },
+    "TEAM_TOTAL_GOALS": {
+      "sample_count": 2640,
+      "log_loss": 0.6449741065070524,
+      "brier": 0.22624496923191925,
+      "mean_prediction": 0.4999999999998941,
+      "observed_hit_rate": 0.5,
+      "ece": 0.1188934280982189,
+      "mce": 0.23260242777944673,
+      "accuracy": null
+    },
+    "TOTAL_CARDS": {
+      "sample_count": 3300,
+      "log_loss": 0.5872116269061596,
+      "brier": 0.1996995083028115,
+      "mean_prediction": 0.5,
+      "observed_hit_rate": 0.5,
+      "ece": 0.0960490070182568,
+      "mce": 0.17385596326890562,
+      "accuracy": null
+    },
+    "TOTAL_CORNERS": {
+      "sample_count": 3300,
+      "log_loss": 0.6807092912122246,
+      "brier": 0.24379085297843295,
+      "mean_prediction": 0.5000000000000001,
+      "observed_hit_rate": 0.5,
+      "ece": 0.10082042931553348,
+      "mce": 0.15885327435943492,
+      "accuracy": null
+    },
+    "TOTAL_GOALS": {
+      "sample_count": 1980,
+      "log_loss": 0.6710757429004376,
+      "brier": 0.23898785106453993,
+      "mean_prediction": 0.499999999998908,
+      "observed_hit_rate": 0.5,
+      "ece": 0.16556431424415508,
+      "mce": 0.31044255271138377,
+      "accuracy": null
+    }
+  },
+  "calibration_configuration": {
+    "evaluation_partition": "untouched_second_half",
+    "fit_partition": "chronological_first_half",
+    "min_bucket_sample": "20",
+    "min_calibration_samples": "20"
+  },
+  "family_metadata": {
+    "BTTS": "binary_platt_logistic",
+    "MATCH_RESULT": "multiclass_temperature_scaling",
+    "TEAM_CORNERS": "binary_platt_logistic",
+    "TEAM_TOTAL_GOALS": "binary_platt_logistic",
+    "TOTAL_CARDS": "binary_platt_logistic",
+    "TOTAL_CORNERS": "binary_platt_logistic",
+    "TOTAL_GOALS": "binary_platt_logistic"
+  },
+  "component_hashes": {
+    "BTTS": "677cce7298a0efbc2b16418abbf1ebfee65b2447026333fbcbbcc38b695f939b",
+    "MATCH_RESULT": "5c07619a154cd7d303c34d37ef8d15f2d9542fc7a7d573d0a51a95d532636457",
+    "TEAM_CORNERS": "b53854b291c58298d7eecf81f0f9e723be33fcd37b23537b0c08b6a35fc69229",
+    "TEAM_TOTAL_GOALS": "99c5a7e80185bfd859c58a7ac34a0614ba4e7d37e5dc84885e3e7df441c3849d",
+    "TOTAL_CARDS": "85aea35cf7b4cd9e018459d0f6a81b7d666d401188019a3dbcf150fda43933bb",
+    "TOTAL_CORNERS": "988ccbf7ce314649bd2ffcab5b36562f5e64d4cc93aff9c6f5f1012f709cccb0",
+    "TOTAL_GOALS": "550e2a393750264d691ce01513e1fda882c0c99a1f30c0dd9bee6b6a645c3a20"
+  },
+  "created_at": "2026-09-14T12:36:22.062230200+00:00",
+  "artifact_sha256": "d7fe4c55d26b2ae803c8b07b08e1e98b5e130c66d3dfeacf5e6e18792c91bb68"
+}

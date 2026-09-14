@@ -9,6 +9,23 @@ npm.cmd install
 npm.cmd run tauri dev
 ```
 
+Gerçek bir lisans kaydı oluşturmadan yerel geliştirme arayüzünü açmak için yalnız debug Tauri çalıştırmasında geliştirme bypass'ı etkinleştirilebilir:
+
+```powershell
+$env:ARZ_DEV_LICENSE_BYPASS="1"
+npm.cmd run tauri dev
+```
+
+İlk açılışta uygulama veritabanını kurar, sabit üretim artefaktlarını doğrulayarak AppData'ya yükler, MODEL_SUPPORTED kapsamındaki 10 ligin iki tamamlanmış sezonuna ait 20 geçmiş veri setini indirip içe aktarır ve canlı üretim akışını hazırlar. Tamamlanan adımlar `first-run-bootstrap.json` içinde sürümlü olarak saklanır; bağlantı hatasından sonra aynı aşamadan devam edilir. Katalogda bulunup model kimliği veya yeterli geçmişi olmayan etkinlikler hazırlığı engellemez. Beş dakikalık günlük yenileme yalnız bu hazırlık tamamlandıktan sonra devralır.
+
+İzole geliştirme/acceptance AppData dizini yalnız debug build'de seçilebilir:
+
+```powershell
+$env:ARZ_DEV_APP_DATA_DIR="C:\temp\arz-fresh-appdata"
+```
+
+Bu değişken normal üretim build'lerinde kullanılmamalıdır. Release/profile binary değişkeni okumaz ve lisanssız kurulumda gerçek aktivasyon ekranını göstermeye devam eder.
+
 Lisans istemcisi yalnız public değerleri Rust derleme ortamından alır:
 
 - `SUPABASE_URL`

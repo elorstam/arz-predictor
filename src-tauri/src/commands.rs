@@ -26,6 +26,7 @@ use crate::{
 pub struct LicenseStatusDto {
     pub state: String,
     pub plan: Option<String>,
+    pub source: Option<String>,
     pub license_id: Option<String>,
     pub activated_at: Option<String>,
     pub expires_at: Option<String>,
@@ -33,6 +34,42 @@ pub struct LicenseStatusDto {
     pub device_bound: bool,
     pub offline_grace_until: Option<String>,
     pub message: String,
+}
+#[tauri::command]
+pub fn first_run_bootstrap_status() -> crate::first_run::Status {
+    crate::first_run::status()
+}
+
+#[cfg(debug_assertions)]
+fn dev_license_bypass_status() -> Option<LicenseStatusDto> {
+    let flag = std::env::var("ARZ_DEV_LICENSE_BYPASS").ok();
+    dev_license_bypass_status_for_build(true, flag.as_deref())
+}
+
+#[cfg(any(debug_assertions, test))]
+fn dev_license_bypass_status_for_build(
+    debug_build: bool,
+    flag: Option<&str>,
+) -> Option<LicenseStatusDto> {
+    (debug_build && flag == Some("1")).then(|| LicenseStatusDto {
+        state: "ACTIVE".into(),
+        plan: Some("LIFETIME".into()),
+        source: Some("DEV_BYPASS".into()),
+        license_id: None,
+        activated_at: None,
+        expires_at: None,
+        last_verified_at: None,
+        device_bound: false,
+        offline_grace_until: None,
+        message: "DEV LICENSE — yalnız debug geliştirme derlemesi için yerel bypass.".into(),
+    })
+}
+
+#[cfg(not(debug_assertions))]
+fn dev_license_bypass_status() -> Option<LicenseStatusDto> {
+    // Release/profile binaries neither inspect the environment nor compile the
+    // synthetic license constructor.
+    None
 }
 
 fn license_file(app: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -58,6 +95,7 @@ fn snapshot_to_dto(snapshot: LicenseSnapshot) -> LicenseStatusDto {
     LicenseStatusDto {
         state: format!("{:?}", snapshot.state),
         plan: claims.as_ref().map(|value| format!("{:?}", value.plan)),
+        source: claims.as_ref().map(|_| "SIGNED_TOKEN".into()),
         license_id: claims.as_ref().map(|value| value.license_id.clone()),
         activated_at: snapshot.activated_at.map(|value| value.to_rfc3339()),
         expires_at: claims
@@ -77,6 +115,7 @@ fn configuration_status(message: impl Into<String>) -> LicenseStatusDto {
     LicenseStatusDto {
         state: format!("{:?}", DesktopLicenseState::SERVER_UNAVAILABLE),
         plan: None,
+        source: None,
         license_id: None,
         activated_at: None,
         expires_at: None,
@@ -89,11 +128,15 @@ fn configuration_status(message: impl Into<String>) -> LicenseStatusDto {
 
 #[tauri::command]
 pub fn license_status(app: AppHandle) -> Result<LicenseStatusDto, String> {
+    if let Some(status) = dev_license_bypass_status() {
+        return Ok(status);
+    }
     let path = license_file(&app)?;
     if !path.exists() {
         return Ok(LicenseStatusDto {
             state: "UNLICENSED".into(),
             plan: None,
+            source: None,
             license_id: None,
             activated_at: None,
             expires_at: None,
@@ -124,6 +167,9 @@ pub fn license_activate(
     app: AppHandle,
     request: LicenseActivateRequest,
 ) -> Result<LicenseStatusDto, String> {
+    if let Some(status) = dev_license_bypass_status() {
+        return Ok(status);
+    }
     let root = license_root(&app)?;
     let path = license_file(&app)?;
     let device_hash = device_fingerprint_hash(&root).map_err(|error| error.to_string())?;
@@ -140,6 +186,9 @@ pub fn license_activate(
 
 #[tauri::command]
 pub fn license_verify(app: AppHandle) -> Result<LicenseStatusDto, String> {
+    if let Some(status) = dev_license_bypass_status() {
+        return Ok(status);
+    }
     let path = license_file(&app)?;
     if !path.exists() {
         return license_status(app);
@@ -161,6 +210,40 @@ pub fn license_clear_local_token(app: AppHandle) -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod license_command_tests {
+    use super::*;
+
+    #[test]
+    fn debug_build_with_bypass_gets_explicit_active_dev_license() {
+        let status = dev_license_bypass_status_for_build(true, Some("1")).unwrap();
+        assert_eq!(status.state, "ACTIVE");
+        assert_eq!(status.plan.as_deref(), Some("LIFETIME"));
+        assert_eq!(status.source.as_deref(), Some("DEV_BYPASS"));
+        assert!(!status.device_bound);
+        assert!(status.offline_grace_until.is_none());
+        assert!(status.license_id.is_none());
+    }
+
+    #[test]
+    fn debug_build_without_exact_bypass_flag_uses_normal_licensing() {
+        assert!(dev_license_bypass_status_for_build(true, None).is_none());
+        assert!(dev_license_bypass_status_for_build(true, Some("0")).is_none());
+        assert!(dev_license_bypass_status_for_build(true, Some("true")).is_none());
+    }
+
+    #[test]
+    fn release_build_rejects_bypass_even_when_requested() {
+        assert!(dev_license_bypass_status_for_build(false, Some("1")).is_none());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn compiled_release_path_ignores_the_environment() {
+        assert!(dev_license_bypass_status().is_none());
     }
 }
 

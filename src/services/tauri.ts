@@ -1,7 +1,7 @@
 import { VersionedCache } from "./versionedCache";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type { BttsAudit } from "../components/BttsCouponCard";
-import type { BulletinStatus, CandidateStatus, CompoundSearch, CompoundSeries, Coupon, CouponPerformance, DailyRun, DataCenterStatus, DatabaseHealth, DatabaseStats, LatestOdd, LineupImpact, LicenseStatus, ModelPerformance, PopularityStatus, PopularResponse, UpcomingMatch, WindowKey } from "../types";
+import type { BulletinStatus, CandidateStatus, CompoundSearch, CompoundSeries, Coupon, CouponPerformance, DailyRun, DataCenterStatus, DatabaseHealth, DatabaseStats, FirstRunStatus, LatestOdd, LineupImpact, LicenseStatus, ModelPerformance, PopularityStatus, PopularResponse, UpcomingMatch, WindowKey } from "../types";
 
 async function call<T>(command:string, args?:Record<string,unknown>):Promise<T> {
   try { return await invoke<T>(command,args); }
@@ -45,6 +45,7 @@ export const api = {
   licenseStatus:()=>call<LicenseStatus>("license_status"), licenseVerify:()=>call<LicenseStatus>("license_verify"), licenseActivate:(licenseKey:string)=>call<LicenseStatus>("license_activate",{request:{licenseKey}}), licenseClearLocalToken:()=>call<void>("license_clear_local_token"),
   health:()=>call<DatabaseHealth>("database_health"), stats:()=>call<DatabaseStats>("database_stats"),
   dataCenterStatus:refreshReadiness,
+  firstRunStatus:()=>call<FirstRunStatus>("first_run_bootstrap_status"),
   currentReadiness:()=>readinessSnapshot??refreshReadiness(),
   refreshIddaa:async()=>{try{const result=await call<unknown>("iddaa_refresh_bulletin");invalidateViews();window.dispatchEvent(new Event("arz-publication-changed"));window.dispatchEvent(new Event("arz-readiness-changed"));return result;}catch(error){invalidateViews();window.dispatchEvent(new Event("arz-readiness-changed"));throw error;}}, refreshPopularity:()=>call<unknown>("iddaa_refresh_popularity"),
   scanLogos:()=>call<unknown>("asset_sync_scan"), startLogoSync:()=>call<boolean>("asset_sync_start"),
