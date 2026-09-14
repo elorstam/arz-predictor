@@ -6,6 +6,285 @@ fn fixture() -> Database {
     fixture_with_odd(2.60)
 }
 
+fn midnight_fixture() -> Database {
+    midnight_fixture_at(false)
+}
+
+fn midnight_fixture_at(live: bool) -> Database {
+    let db = fixture_with_odd(1.3);
+    let c = db.connection().unwrap();
+    c.execute("UPDATE matches SET kickoff_at='2026-09-02T17:00:00Z'", [])
+        .unwrap();
+    let (date, generated) = if live {
+        let now = chrono::Utc::now();
+        let generated = (now - chrono::Duration::minutes(2)).to_rfc3339();
+        let kickoff = (now - chrono::Duration::minutes(1)).to_rfc3339();
+        let cutoff = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let date = crate::business_clock::date();
+        c.execute(
+            "UPDATE matches SET scheduled_local_date=?1,kickoff_at=?2",
+            params![date, kickoff],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) SELECT match_id,market,selection,line_value,model_probability,confidence_bucket,?1,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,?2 FROM predictions",
+            params![kickoff, cutoff],
+        )
+        .unwrap();
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,?1 FROM odds_snapshots", [&cutoff])
+            .unwrap();
+        c.execute(
+            "INSERT INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json,calculated_at) SELECT match_id,feature_engine_version,?1,feature_json,data_quality_json,?1 FROM feature_sets",
+            [&cutoff],
+        )
+        .unwrap();
+        (date, generated)
+    } else {
+        ("2026-09-02".to_owned(), "2026-09-02T15:00:00Z".to_owned())
+    };
+    // Add BTTS before immutable candidate generation so category overlays are covered.
+    c.execute("INSERT INTO predictions(match_id,market,selection,line_value,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at) SELECT match_id,'BTTS','YES',NULL,model_probability,confidence_bucket,kickoff_at,model_version_id,raw_probability,public_probability,calibration_status,calibration_version,bucket_sample_size,availability,created_at FROM predictions", []).unwrap();
+    c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,captured_at) SELECT match_id,provider,'btts','BTTS','YES',odd,'BTTS','YES',captured_at FROM odds_snapshots", []).unwrap();
+    let run = candidate_engine::generate(
+        &c,
+        &candidate_engine::GenerateRequest {
+            business_date: Some(date),
+            generation_time: Some(generated),
+            category: None,
+            dry_run: Some(false),
+        },
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+        [run.run_id],
+    )
+    .unwrap();
+    coupon_engine::generate_daily(
+        &c,
+        &coupon_engine::GenerateRequest {
+            business_date: run.business_date,
+            candidate_run_id: Some(run.run_id),
+            coupon_type: None,
+            unit_stake_cents: Some(100),
+        },
+    )
+    .unwrap();
+    let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("resources/production/base-model.json");
+    c.execute(
+        "UPDATE model_versions SET artifact_path=?1",
+        [artifact.to_str().unwrap()],
+    )
+    .unwrap();
+    drop(c);
+    db
+}
+
+#[test]
+fn started_daily_snapshot_is_not_replaced_by_later_valid_candidates() {
+    let db = midnight_fixture();
+    let c = db.connection().unwrap();
+    let original = coupon_engine::get_daily(&c, "2026-09-02", Some("DAILY_OVER_25"))
+        .unwrap()
+        .remove(0);
+    c.execute("UPDATE matches SET kickoff_at='2026-09-02T20:30:00Z' WHERE id NOT IN (SELECT match_id FROM phase8_coupon_selections WHERE coupon_id=?1)",[original.id]).unwrap();
+    let run = candidate_engine::generate(
+        &c,
+        &candidate_engine::GenerateRequest {
+            business_date: Some("2026-09-02".into()),
+            generation_time: Some("2026-09-02T17:05:00Z".into()),
+            category: None,
+            dry_run: Some(false),
+        },
+    )
+    .unwrap();
+    assert!(
+        run.candidates
+            .iter()
+            .filter(|x| x.category == "OVER_25")
+            .count()
+            >= 3
+    );
+    c.execute(
+        "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+        [run.run_id],
+    )
+    .unwrap();
+    coupon_engine::generate_daily(
+        &c,
+        &coupon_engine::GenerateRequest {
+            business_date: run.business_date,
+            candidate_run_id: Some(run.run_id),
+            coupon_type: Some("DAILY_OVER_25".into()),
+            unit_stake_cents: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        coupon_engine::get_daily(&c, "2026-09-02", Some("DAILY_OVER_25")).unwrap(),
+        vec![original]
+    );
+}
+
+#[test]
+fn settled_katlama_card_remains_alongside_same_day_next_step() {
+    let db = midnight_fixture();
+    let c = db.connection().unwrap();
+    let run_id:i64=c.query_row("SELECT candidate_run_id FROM daily_output_publications WHERE business_date='2026-09-02'",[],|r|r.get(0)).unwrap();
+    let series = coupon_engine::start_series(&c, "2026-09-02", 10000).unwrap();
+    let original = coupon_engine::generate_compound_step(&c, "2026-09-02", Some(run_id)).unwrap();
+    c.execute("UPDATE matches SET status='finished',final_home_goals=0,final_away_goals=0 WHERE id IN (SELECT match_id FROM phase8_coupon_selections WHERE coupon_id=?1)",[original.id]).unwrap();
+    c.execute(
+        "UPDATE matches SET kickoff_at='2026-09-02T20:30:00Z' WHERE status='scheduled'",
+        [],
+    )
+    .unwrap();
+    super::coupon_settlement::run(&c).unwrap();
+    let run = candidate_engine::generate(
+        &c,
+        &candidate_engine::GenerateRequest {
+            business_date: Some("2026-09-02".into()),
+            generation_time: Some("2026-09-02T19:00:00Z".into()),
+            category: None,
+            dry_run: Some(false),
+        },
+    )
+    .unwrap();
+    c.execute(
+        "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+        [run.run_id],
+    )
+    .unwrap();
+    coupon_engine::publish_active_compound(&c, "2026-09-02", run.run_id).unwrap();
+    let visible = coupon_engine::get_daily(&c, "2026-09-02", Some("DAILY_COMPOUND")).unwrap();
+    assert_eq!(visible.len(), 2);
+    assert_eq!(
+        visible
+            .iter()
+            .find(|x| x.id == original.id)
+            .unwrap()
+            .settlement_result
+            .as_deref(),
+        Some("LOST")
+    );
+    assert_eq!(
+        visible
+            .iter()
+            .filter(|x| x.publication_status == "READY")
+            .count(),
+        1
+    );
+    assert_eq!(coupon_engine::series(&c, series.id).unwrap().reset_count, 1);
+    coupon_engine::publish_active_compound(&c, "2026-09-02", run.run_id).unwrap();
+    assert_eq!(
+        coupon_engine::get_daily(&c, "2026-09-02", Some("DAILY_COMPOUND")).unwrap(),
+        visible
+    );
+}
+
+#[test]
+fn published_daily_coupons_survive_kickoff_settlement_reopen_and_date_switch() {
+    for home_goals in [0, 3] {
+        let db = midnight_fixture();
+        let c = db.connection().unwrap();
+        let initial = coupon_engine::get_daily(&c, "2026-09-02", None).unwrap();
+        assert!(initial.iter().any(|x| x.coupon_type == "DAILY_BTTS"));
+        let ids: Vec<_> = initial.iter().map(|x| x.id).collect();
+        // 20:05 Istanbul: candidate generation correctly drops started matches.
+        let run = candidate_engine::generate(
+            &c,
+            &candidate_engine::GenerateRequest {
+                business_date: Some("2026-09-02".into()),
+                generation_time: Some("2026-09-02T17:05:00Z".into()),
+                category: None,
+                dry_run: Some(false),
+            },
+        )
+        .unwrap();
+        assert!(run.candidates.is_empty());
+        c.execute(
+            "UPDATE candidate_run_execution SET purpose='LIVE' WHERE run_id=?1",
+            [run.run_id],
+        )
+        .unwrap();
+        let request = coupon_engine::GenerateRequest {
+            business_date: run.business_date,
+            candidate_run_id: Some(run.run_id),
+            coupon_type: None,
+            unit_stake_cents: Some(100),
+        };
+        coupon_engine::generate_daily(&c, &request).unwrap();
+        assert_eq!(
+            coupon_engine::get_daily(&c, "2026-09-02", None)
+                .unwrap()
+                .iter()
+                .map(|x| x.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        c.execute(
+            "UPDATE matches SET status='finished',final_home_goals=?1,final_away_goals=0",
+            [home_goals],
+        )
+        .unwrap();
+        super::coupon_settlement::run(&c).unwrap();
+        let settled = coupon_engine::get_daily(&c, "2026-09-02", None).unwrap();
+        assert_eq!(settled.iter().map(|x| x.id).collect::<Vec<_>>(), ids);
+        assert!(settled.iter().all(|x| x.publication_status == "SETTLED"));
+        let goals = settled
+            .iter()
+            .find(|x| x.coupon_type == "DAILY_OVER_25")
+            .unwrap();
+        assert_eq!(
+            goals.settlement_result.as_deref(),
+            Some(if home_goals == 0 { "LOST" } else { "WON" })
+        );
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM phase8_coupons", [], |r| r.get(0))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("restart.sqlite3");
+        c.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let reopened = Database::open(path).unwrap();
+        let rc = reopened.connection().unwrap();
+        coupon_engine::generate_daily(&rc, &request).unwrap();
+        assert_eq!(
+            rc.query_row("SELECT COUNT(*) FROM phase8_coupons", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            count
+        );
+        assert_eq!(
+            coupon_engine::get_daily(&rc, "2026-09-02", None).unwrap(),
+            settled
+        );
+        assert!(coupon_engine::get_daily(&rc, "2026-09-03", None)
+            .unwrap()
+            .is_empty());
+        assert!(coupon_engine::get_coupon(&rc, goals.id)
+            .unwrap()
+            .settlement_result
+            .is_some());
+    }
+}
+
+#[test]
+#[ignore = "controlled desktop export; set ARZ_MIDNIGHT_ACCEPTANCE_DIR"]
+fn export_midnight_persistence_desktop() {
+    let root = std::path::PathBuf::from(std::env::var("ARZ_MIDNIGHT_ACCEPTANCE_DIR").unwrap());
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("football-predictor.sqlite3");
+    assert!(!path.exists());
+    midnight_fixture_at(std::env::var("ARZ_MIDNIGHT_LIVE_FIXTURE").as_deref() == Ok("1"))
+        .connection()
+        .unwrap()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    std::fs::write(root.join("first-run-bootstrap.json"),serde_json::json!({"version":crate::first_run::BOOTSTRAP_VERSION,"completed":[],"reports":{},"durations_ms":{},"started_at":"2026-09-02T15:00:00Z","completed_at":"2026-09-02T15:00:00Z","attempts":1,"error":null}).to_string()).unwrap();
+}
+
 // A real persisted coupon from yesterday, with today's independent, eligible selections.
 fn katlama_live_fixture(no_combo: bool, step: i64) -> (Database, i64) {
     let db = fixture_with_odd(1.30);

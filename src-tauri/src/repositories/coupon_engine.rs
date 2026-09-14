@@ -39,6 +39,7 @@ pub struct Coupon {
     pub step_number: Option<usize>,
     pub status: String,
     pub publication_status: String,
+    pub settlement_result: Option<String>,
     pub candidate_ids: Vec<i64>,
     pub selections: Vec<CouponSelectionSnapshot>,
     pub system_sizes: Vec<usize>,
@@ -570,6 +571,21 @@ pub fn generate_daily(c: &Connection, r: &GenerateRequest) -> Result<Vec<Coupon>
     let mut out = Vec::new();
     for kind in kinds {
         let Some(cat) = category(kind) else { continue };
+        // Live daily snapshots stop changing once a leg starts. Candidate refreshes
+        // still run normally, and Katlama remains free to publish its next step.
+        let live: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM candidate_run_execution WHERE run_id=?1 AND purpose='LIVE')", [run.run_id], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if live && kind != "DAILY_COMPOUND" {
+            if let Some(published) = get_daily(c, &r.business_date, Some(kind))?
+                .into_iter()
+                .next()
+            {
+                let started: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM phase8_coupon_selections s JOIN matches m ON m.id=s.match_id WHERE s.coupon_id=?1 AND julianday(m.kickoff_at)<=julianday(?2))", params![published.id,run.generated_at], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if started {
+                    out.push(published);
+                    continue;
+                }
+            }
+        }
         let category_run = if r.candidate_run_id.is_none() {
             let p = super::daily_selections::publication(c, &r.business_date)?;
             Some(source(c, &r.business_date, Some(p.category_run_ids[cat]))?)
@@ -991,6 +1007,13 @@ pub fn get_coupon(c: &Connection, id: i64) -> Result<Coupon, String> {
         .map_err(|e| e.to_string())?;
     let mut coupon = Coupon {
         publication_status: "DRAFT".into(),
+        settlement_result: c
+            .query_row(
+                "SELECT settlement_result FROM phase8_coupons WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?,
         id,
         status: h.9,
         coupon_type: h.0,
@@ -1210,7 +1233,9 @@ pub fn get_daily(c: &Connection, date: &str, kind: Option<&str>) -> Result<Vec<C
     };
     let base = publication.as_ref().map(|p| p.candidate_run_id);
     let btts = publication.as_ref().map(|p| p.category_run_ids["BTTS_YES"]);
-    let mut q=c.prepare("SELECT id FROM phase8_coupons c WHERE business_date=?1 AND (?2 IS NULL OR coupon_type=?2) AND c.status<>'CANCELLED' AND EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=c.id) AND (c.coupon_type<>'DAILY_BTTS' OR c.source_candidate_run_id=?4) AND (c.status<>'DRAFT' OR c.series_id IS NOT NULL OR c.source_candidate_run_id=CASE WHEN c.coupon_type='DAILY_BTTS' THEN ?4 ELSE ?3 END) ORDER BY id DESC").map_err(|e|e.to_string())?;
+    // The current candidate pool is not the lifetime of a published daily coupon.
+    // Retain live published snapshots across newer/empty pools, scoped to this date.
+    let mut q=c.prepare("SELECT id FROM phase8_coupons c WHERE business_date=?1 AND (?2 IS NULL OR coupon_type=?2) AND c.status<>'CANCELLED' AND EXISTS(SELECT 1 FROM phase8_coupon_selections s WHERE s.coupon_id=c.id) AND (c.status<>'DRAFT' OR c.series_id IS NOT NULL OR c.source_candidate_run_id=CASE WHEN c.coupon_type='DAILY_BTTS' THEN ?4 ELSE ?3 END OR (json_extract(c.metadata_json,'$.published')=1 AND NOT EXISTS(SELECT 1 FROM candidate_run_execution e WHERE e.run_id=c.source_candidate_run_id AND e.purpose='REPLAY'))) ORDER BY id DESC").map_err(|e|e.to_string())?;
     let ids = q
         .query_map(params![date, kind, base, btts], |x| x.get(0))
         .map_err(|e| e.to_string())?
@@ -1224,7 +1249,7 @@ pub fn get_daily(c: &Connection, date: &str, kind: Option<&str>) -> Result<Vec<C
     Ok(values
         .into_iter()
         .filter(|c| rule_compliant(c) && c.publication_status != "DRAFT")
-        .filter(|c| seen.insert(c.coupon_type.clone()))
+        .filter(|c| c.coupon_type == "DAILY_COMPOUND" || seen.insert(c.coupon_type.clone()))
         .collect())
 }
 

@@ -563,15 +563,18 @@ mod tests {
     }
 
     #[test]
-    fn btts_stale_or_invalid_pairs_cannot_fill_coupon_and_hide_previous_ready_snapshot() {
+    fn btts_stale_or_invalid_pairs_cannot_fill_coupon_but_preserve_published_snapshot() {
         let db = fixture();
         let c = db.connection().unwrap();
-        publish(&c, "2026-09-13", "2026-09-13T12:00:00Z", None).unwrap();
-        // A new assessment with stale quotes must hide the older ready BTTS coupon.
+        let original = publish(&c, "2026-09-13", "2026-09-13T12:00:00Z", None).unwrap();
+        // A stale pool cannot create a new coupon or erase the day's published one.
         let a = publish(&c, "2026-09-13", "2026-09-14T12:00:00Z", None).unwrap();
         assert_eq!(a.stages["ranking_pool"], 0);
         assert_eq!(a.primary_exclusions.get("STALE_ODDS"), Some(&8));
-        assert!(coupons::get_daily(&c, "2026-09-13", Some("DAILY_BTTS"))
+        let visible = coupons::get_daily(&c, "2026-09-13", Some("DAILY_BTTS")).unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(Some(visible[0].id), original.coupon_id);
+        assert!(coupons::get_daily(&c, "2026-09-14", Some("DAILY_BTTS"))
             .unwrap()
             .is_empty());
         c.execute("INSERT INTO predictions(match_id,market,selection,model_probability,confidence_bucket,kickoff_at,model_version_id,public_probability,calibration_status,availability,created_at) VALUES(1,'BTTS','YES',0.9,'test','2026-09-13T18:00:00Z',1,0.9,'UNCALIBRATED_V1','AVAILABLE','2026-09-13T11:30:00Z')",[]).unwrap();

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { readyCoupons, couponTypeOrder } from "../lib/readyCoupons";
+import { publishedDailyCoupons, couponTypeOrder } from "../lib/readyCoupons";
 import { katlamaStatus } from "../lib/katlamaStatus";
 import { useBusinessDate } from "../hooks/useBusinessDate";
 import { useAsync } from "../hooks/useAsync";
@@ -22,10 +22,10 @@ export function CouponsPage() {
   useEffect(() => { window.addEventListener("btts-updated", state.reload); return () => window.removeEventListener("btts-updated", state.reload); }, [state.reload]);
   return <div className="daily-coupons-page"><PageHeader eyebrow="GÜNÜN SEÇİMLERİ" title="Günün Kuponları" description="Modelin seçtiği maçlar. Tek bakışta olasılık, oran ve kupon." actions={<button className="button secondary" onClick={state.reload}>Yenile</button>} />
     <DataState {...state} onRetry={state.reload}>{({ coupons, matches, compound, run, search }) => {
-      const ready = readyCoupons(coupons);
-      return <><CompoundStatus date={date} series={compound} search={search} ready={ready.some(c => c.coupon_type === "DAILY_COMPOUND")} onChange={state.reload} />
-        <div className="daily-coupon-heading"><h2>Hazır kuponlar <span>{ready.length}</span></h2><span>{date} · İstanbul</span></div>
-        {ready.length ? <div className="coupon-grid">{ready.map(coupon => <CouponCard key={coupon.id} coupon={coupon} matches={matches} />)}</div> : <EmptyState title="Henüz hazır kupon yok" detail="Uygun seçimler bulunduğunda kuponlar otomatik olarak burada görünür." />}
+      const ready = publishedDailyCoupons(coupons, date);
+      return <><CompoundStatus date={date} series={compound} search={search} ready={ready.some(c => c.coupon_type === "DAILY_COMPOUND" && c.publication_status === "READY")} onChange={state.reload} />
+        <div className="daily-coupon-heading"><h2>Yayımlanan kuponlar <span>{ready.length}</span></h2><span>{date} · İstanbul</span></div>
+        {ready.length ? <div className="coupon-grid">{ready.map(coupon => <CouponCard key={coupon.id} coupon={coupon} matches={matches} />)}</div> : <EmptyState title="Henüz yayımlanmış kupon yok" detail="Uygun seçimler bulunduğunda kuponlar otomatik olarak burada görünür." />}
         <details className="daily-coupon-technical"><summary>Diğer kategoriler ve teknik ayrıntılar</summary><div className="daily-unavailable">{couponTypeOrder.filter(kind => !ready.some(c => c.coupon_type === kind)).map(kind => <div key={kind}><strong>{names[kind]}</strong><span>{kind === "DAILY_COMPOUND" ? katlamaStatus(compound, date, false, search) : "Bugün yeterli uygun seçim bulunamadı"}</span></div>)}</div>
           {!ready.some(c => c.coupon_type === "DAILY_BTTS") && <BttsCouponDiagnostics date={date} />}
           <p>Yayın {run.publication_id} · {run.prediction_context}</p><details><summary>Katlama kombinasyon araması</summary><p>{search.pool_size} uygun aday · {search.pairs_evaluated} ikili · {search.triples_evaluated} üçlü · {search.valid_combinations} uygun kombinasyon</p><p>2–3 seçim · toplam oran 1,50–1,80 · hedef 1,80</p></details><details><summary>Aday eleme nedenleri</summary>{run.exclusions?.map((e, i) => <p key={i}>{e.category} · {e.reason}</p>)}</details>
@@ -35,7 +35,7 @@ export function CouponsPage() {
 function CouponCard({ coupon, matches }: { coupon: Coupon; matches: UpcomingMatch[] }) {
   const check = useAsync(() => api.couponImpact(coupon.id), [coupon.id], false);
   return <article className="panel coupon-card" data-coupon-type={coupon.coupon_type} data-coupon-id={coupon.id}>
-    <header className="daily-coupon-header"><div><span className="eyebrow">{coupon.selections.length} SEÇİM{coupon.step_number ? ` · ADIM ${coupon.step_number}` : ""}</span><h2>{names[coupon.coupon_type]}</h2></div><StatusBadge value="READY" /></header>
+    <header className="daily-coupon-header"><div><span className="eyebrow">{coupon.selections.length} SEÇİM{coupon.step_number ? ` · ADIM ${coupon.step_number}` : ""}</span><h2>{names[coupon.coupon_type]}</h2></div><StatusBadge value={coupon.settlement_result ?? coupon.publication_status} /></header>
     <div className="daily-coupon-odd"><span>{coupon.system_sizes.length ? "Sistem" : "Toplam oran"}</span><strong>{coupon.system_sizes.length ? coupon.system_sizes.join(" / ") : decimal(coupon.combined_decimal_odd)}</strong>{coupon.system_sizes.length > 0 && <small>{coupon.columns.length} kolon</small>}</div>
     <div className="daily-selection-labels"><span>Maç / seçim</span><span>Olasılık</span><span>Oran</span></div><div className="daily-selection-list">{coupon.selections.map(s => {
       const match = matches.find(m => m.match_id === s.match_id);
