@@ -65,7 +65,7 @@ fn migration_0010_and_oos_identity_are_present() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(max, 32);
+    assert_eq!(max, 33);
     for table in [
         "backtest_runs",
         "backtest_predictions",

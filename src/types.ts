@@ -18,7 +18,7 @@ export interface CouponSelection { settlement_state:string; settlement_reason:st
 export interface SystemColumn { column_number:number; system_size:number; candidate_ids:number[]; column_decimal_odd:number; status:string }
 export interface Coupon { publication_status:string; settlement_result?:string|null; id:number; coupon_type:string; business_date:string; status:string; selections:CouponSelection[]; system_sizes:number[]; columns:SystemColumn[]; combined_decimal_odd:number|null; unit_stake_cents:number|null; total_stake_cents:number|null; series_id:number|null; step_number:number|null }
 export interface CompoundSeriesStep { step_number:number; coupon_id:number; business_date:string; stake_cents:number; combined_odd:number; result:string; settled_at:string|null }
-export interface CompoundSeries { id:number; business_date:string; status:string; current_step:number; starting_stake_cents:number; current_stake_cents:number; completed_steps:number; latest_coupon_id:number|null; reset_count:number; history:CompoundSeriesStep[] }
+export interface CompoundSeries { id:number; business_date:string; status:string; current_step:number; starting_stake_cents:number; current_stake_cents:number; completed_steps:number; latest_coupon_id:number|null; reset_count:number; manually_reset?:boolean; history:CompoundSeriesStep[] }
 export interface LineupImpactItem { match_id:number; market:string; selection:string; line:number|null; base_probability:number; latest_probability:number; delta_percentage_points:number; impact_type:string; prediction_source:string; family_status:string|null }
 export interface LineupImpact { revision_available:boolean; affected_selection_count:number; items:LineupImpactItem[] }
 

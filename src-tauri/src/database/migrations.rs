@@ -167,6 +167,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "production_history_epoch",
         sql: include_str!("../../migrations/0032_production_history_epoch.sql"),
     },
+    Migration {
+        version: 33,
+        name: "production_feature_revisions",
+        sql: include_str!("../../migrations/0033_production_feature_revisions.sql"),
+    },
 ];
 
 pub fn apply_pending(connection: &mut Connection) -> rusqlite::Result<()> {
@@ -209,9 +214,9 @@ mod tests {
     fn production_schema_27_and_28_upgrade_preserves_rows_and_bookkeeping() {
         assert_eq!(
             MIGRATIONS.iter().map(|m| m.version).collect::<Vec<_>>(),
-            (1..=32).collect::<Vec<_>>()
+            (1..=33).collect::<Vec<_>>()
         );
-        for baseline in [27, 28] {
+        for baseline in [27, 28, 32] {
             let mut c = Connection::open_in_memory().unwrap();
             c.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,applied_at TEXT NOT NULL DEFAULT 'baseline');").unwrap();
             for m in MIGRATIONS.iter().filter(|m| m.version <= baseline) {
@@ -228,7 +233,7 @@ mod tests {
             let rows: i64 = c
                 .query_row("SELECT COUNT(*) FROM schema_migrations", [], |r| r.get(0))
                 .unwrap();
-            assert_eq!(rows, 32);
+            assert_eq!(rows, 33);
             let unchanged: i64 = c.query_row("SELECT COUNT(*) FROM schema_migrations WHERE version<=?1 AND applied_at='baseline'", [baseline], |r|r.get(0)).unwrap();
             assert_eq!(unchanged, baseline);
             assert_eq!(
@@ -244,6 +249,7 @@ mod tests {
                 "coupon_selection_settlement_audit",
                 "coupon_result_refresh",
                 "popularity_selection_quotes",
+                "production_feature_revisions",
             ] {
                 assert_eq!(
                     c.query_row::<i64, _, _>(

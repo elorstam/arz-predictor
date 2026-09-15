@@ -58,6 +58,7 @@ export const api = {
   generateCompound:(businessDate:string)=>call<Coupon>("compound_series_generate_step",{request:{businessDate,candidateRunId:null,couponType:"DAILY_COMPOUND",unitStakeCents:null}}),
   compoundSearch:(businessDate:string)=>call<CompoundSearch>("compound_search_status",{businessDate}),
   prioritizeMatches:(matchIds:number[])=>call<void>("asset_prioritize_matches",{matchIds}),
+  resetCompound:(seriesId:number)=>call<CompoundSeries>("compound_series_manual_reset",{request:{seriesId}}),
   compound:()=>call<CompoundSeries|null>("compound_series_status"),
   coupon:(couponId:number)=>call<Coupon>("coupon_engine_get_coupon",{request:{couponId}}),
   populars:(businessDate:string,supportedOnly=false)=>call<PopularResponse>("model_supported_populars_get",{request:{businessDate,supportedOnly,limit:100}}),

@@ -806,6 +806,52 @@ pub fn persist(c: &Connection, s: &FeatureSnapshot) -> Result<bool, String> {
     c.execute("INSERT OR IGNORE INTO feature_sets(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,?2,?3,?4,?5)",params![s.match_id,s.feature_engine_version,s.cutoff_at,f,q]).map(|n|n>0).map_err(|e|e.to_string())
 }
 
+/// Validate the current fixture's snapshot, not aggregate historical training quality.
+pub fn current_snapshot_ready(c: &Connection, id: i64) -> Result<bool, String> {
+    let row: Option<(String, i64, i64, i64, String)> = c.query_row(
+        "SELECT f.feature_json,m.competition_id,m.home_team_id,m.away_team_id,CASE WHEN m.kickoff_time_known=1 THEN m.kickoff_at ELSE m.scheduled_local_date END FROM matches m JOIN (SELECT id,match_id,feature_engine_version,cutoff_at,feature_json,0 revision FROM feature_sets UNION ALL SELECT id,match_id,feature_engine_version,cutoff_at,feature_json,1 revision FROM production_feature_revisions) f ON f.match_id=m.id AND f.feature_engine_version=?2 AND julianday(f.cutoff_at)=julianday(CASE WHEN m.kickoff_time_known=1 THEN m.kickoff_at ELSE m.scheduled_local_date END) WHERE m.id=?1 ORDER BY f.revision DESC,f.id DESC LIMIT 1",
+        params![id, FEATURE_ENGINE_VERSION], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(|e|e.to_string())?;
+    Ok(row.is_some_and(|(json, competition, home, away, kickoff)| {
+        serde_json::from_str::<FeatureSnapshot>(&json).is_ok_and(|s| {
+            s.match_id == id
+                && s.competition_id == competition
+                && s.home_team_id == home
+                && s.away_team_id == away
+                && s.feature_engine_version == FEATURE_ENGINE_VERSION
+                && (DateTime::parse_from_rfc3339(&s.cutoff_at)
+                    .ok()
+                    .zip(DateTime::parse_from_rfc3339(&kickoff).ok())
+                    .is_some_and(|(a, b)| a == b)
+                    || NaiveDate::parse_from_str(&s.cutoff_at, "%Y-%m-%d")
+                        .ok()
+                        .zip(NaiveDate::parse_from_str(&kickoff, "%Y-%m-%d").ok())
+                        .is_some_and(|(a, b)| a == b))
+                && s.data_quality.history_matches_home >= MIN_SAMPLE
+                && s.data_quality.history_matches_away >= MIN_SAMPLE
+        })
+    }))
+}
+
+/// A recovered future fixture may retain its pre-history-import snapshot at the
+/// same unique cutoff. Append a revision; never rewrite historical snapshots.
+pub fn ensure_current_snapshot(c: &Connection, id: i64) -> Result<bool, String> {
+    if current_snapshot_ready(c, id)? {
+        return Ok(false);
+    }
+    let future: bool = c.query_row("SELECT status='scheduled' AND julianday(kickoff_at)>julianday(?2) FROM matches WHERE id=?1", params![id,crate::business_clock::now().to_rfc3339()], |r|r.get(0)).map_err(|e|e.to_string())?;
+    if !future {
+        return Ok(false);
+    }
+    let snapshot = generate(c, id)?;
+    let f = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+    let q = serde_json::to_string(&snapshot.data_quality).map_err(|e| e.to_string())?;
+    if persist(c, &snapshot)? {
+        return Ok(true);
+    }
+    c.execute("INSERT OR IGNORE INTO production_feature_revisions(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,?2,?3,?4,?5)", params![id,snapshot.feature_engine_version,snapshot.cutoff_at,f,q]).map_err(|e|e.to_string())?;
+    Ok(true)
+}
+
 pub fn persist_label(c: &Connection, label: &TrainingLabel) -> Result<bool, String> {
     let json = serde_json::to_string(label).map_err(|e| e.to_string())?;
     c.execute(

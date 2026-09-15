@@ -408,6 +408,12 @@ fn stage(database: &Database, resources: &Path, id: &str) -> Result<Value, Strin
             .map(|summary| json!(summary)),
         "logos" => Ok(json!({"state": "BACKGROUND_QUEUE_STARTED"})),
         "readiness" => {
+            // Earlier stages may be complete in an imported/recovered manifest,
+            // while their current-date inputs or snapshots were repaired later.
+            {
+                let connection = database.connection()?;
+                current_flow::repair_readiness_dependencies(&connection)?;
+            }
             let runtime = historical_runtime(database)?;
             let connection = database.connection()?;
             let counts: (i64, i64, i64) = connection.query_row("SELECT (SELECT COUNT(*) FROM predictions),(SELECT COUNT(*) FROM candidate_engine_candidates),(SELECT COUNT(*) FROM phase8_coupons)", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(|error| error.to_string())?;
@@ -439,6 +445,13 @@ fn run_attempt(
     manifest_path: &Path,
     manifest: &mut Manifest,
 ) -> Result<(), String> {
+    if manifest.completed_at.is_some()
+        && STAGES
+            .iter()
+            .all(|(id, _)| manifest.completed.contains(*id))
+    {
+        return Ok(());
+    }
     {
         let c = database.connection()?;
         production_scope::repair(&c).map_err(|e| e.to_string())?;
@@ -552,6 +565,235 @@ pub fn start(database_path: PathBuf, resources: PathBuf, app: AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn office_fixture(root: &Path) -> Database {
+        let db = Database::open(root.join("football-predictor.sqlite3")).unwrap();
+        install_artifacts(
+            &db,
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/production"),
+        )
+        .unwrap();
+        let c = db.connection().unwrap();
+        production_scope::test_history(&c);
+        c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known,final_home_goals,final_away_goals) SELECT competition_id,'2024/25',home_team_id,away_team_id,replace(kickoff_at,'2026-01','2025-01'),status,replace(scheduled_local_date,'2026-01','2025-01'),1,2,1 FROM matches WHERE status='finished'", []).unwrap();
+        let dataset = required_datasets()[0];
+        let cache = root.join("data/football-data").join(dataset.season_code);
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(
+            cache.join(format!("{}.csv", dataset.league_code)),
+            "retained acceptance cache",
+        )
+        .unwrap();
+        c.execute("INSERT INTO data_import_runs(provider,dataset_key,season,source_url,status,completed_at,rows_seen) VALUES('football-data.co.uk',?1,?2,'acceptance','completed',?3,120)",rusqlite::params![dataset.key(),dataset.season,chrono::Utc::now().to_rfc3339()]).unwrap();
+        let now = chrono::Utc::now();
+        let kickoff = (now + chrono::Duration::hours(1)).to_rfc3339();
+        let date = crate::business_clock::date();
+        c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) SELECT competition_id,'2026/27',home_team_id,away_team_id,?1,'scheduled',?2,1 FROM matches WHERE status='finished' GROUP BY competition_id",rusqlite::params![kickoff,date]).unwrap();
+        c.execute("INSERT INTO provider_match_mappings(provider,external_match_id,match_id) SELECT 'iddaa','office-'||id,id FROM matches WHERE status='scheduled'", []).unwrap();
+        c.execute("INSERT INTO odds_snapshots(match_id,provider,market_code,market_name,selection,odd,normalized_market_type,normalized_selection,line_value,captured_at) SELECT id,'iddaa','goals','Goals','OVER',1.30,'TOTAL_GOALS','OVER',2.5,?1 FROM matches WHERE status='scheduled'",[now.to_rfc3339()]).unwrap();
+        c.execute("INSERT INTO popularity_snapshots(provider,provider_event_id,metric_type,metric_value,raw_metric_name,captured_at) VALUES('iddaa','office','COUNT',100,'count',?1)",[now.to_rfc3339()]).unwrap();
+        let ids = current_flow::production_matches(&c, &now.to_rfc3339()).unwrap();
+        assert!(!ids.is_empty());
+        // Reproduce snapshots captured before the recovered history became available.
+        for id in ids {
+            let mut stale = features::generate(&c, id).unwrap();
+            stale.data_quality.history_matches_home = 0;
+            stale.data_quality.history_matches_away = 0;
+            features::persist(&c, &stale).unwrap();
+            let (model, artifact) = prediction_engine::active(&c).unwrap();
+            let fresh = features::generate(&c, id).unwrap();
+            let mut prediction = prediction_engine::infer(&artifact, &fresh).unwrap();
+            calibration::apply(
+                &mut prediction,
+                &calibration::active_calibration(&c).unwrap().unwrap(),
+            );
+            prediction_engine::persist_predictions(&c, &prediction, model, &kickoff).unwrap();
+        }
+        crate::repositories::candidate_engine::generate_daily_output(
+            &c,
+            &crate::repositories::candidate_engine::GenerateRequest {
+                business_date: Some(date),
+                generation_time: None,
+                category: None,
+                dry_run: Some(false),
+            },
+        )
+        .unwrap();
+        drop(c);
+        let mut manifest = Manifest {
+            version: BOOTSTRAP_VERSION.into(),
+            attempts: 3,
+            ..Default::default()
+        };
+        manifest.completed.extend(
+            STAGES
+                .iter()
+                .filter(|(id, _)| *id != "readiness")
+                .map(|(id, _)| id.to_string()),
+        );
+        manifest.error = Some("READINESS_NOT_COMPLETE: 7/10".into());
+        write_manifest(&manifest_path(db.path()), &manifest).unwrap();
+        db
+    }
+
+    #[test]
+    fn office_readiness_recovers_twelve_stages_without_duplicate_publications() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = office_fixture(dir.path());
+        let runtime = historical_runtime(&db).unwrap();
+        let c = db.connection().unwrap();
+        let before = data_center::status(&c, &runtime, chrono::Utc::now()).unwrap();
+        assert_eq!(before.core_ready_count, 7, "{:?}", before.core_checks);
+        assert!(
+            !before.can_generate_predictions.ready
+                && !before.can_generate_candidates.ready
+                && !before.can_generate_coupons.ready
+        );
+        let count = |c: &rusqlite::Connection| {
+            c.query_row("SELECT json_array((SELECT count(*) FROM matches),(SELECT count(*) FROM teams),(SELECT count(*) FROM predictions),(SELECT count(*) FROM candidate_engine_runs),(SELECT count(*) FROM phase8_coupons))",[],|r|r.get::<_,String>(0)).unwrap()
+        };
+        let counts = count(&c);
+        let snapshots: String = c
+            .query_row(
+                "SELECT json_group_array(feature_json) FROM feature_sets",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(c);
+        let path = manifest_path(db.path());
+        let mut manifest = read_manifest(&path);
+        assert_eq!(manifest.completed.len(), 12);
+        run_attempt(
+            &db,
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/production"),
+            &path,
+            &mut manifest,
+        )
+        .unwrap();
+        assert_eq!(manifest.completed.len(), 13);
+        assert!(manifest.completed_at.is_some());
+        let c = db.connection().unwrap();
+        let after = data_center::status(&c, &runtime, chrono::Utc::now()).unwrap();
+        assert_eq!(after.core_ready_count, 10, "{:?}", after.core_checks);
+        assert!(
+            after.can_generate_predictions.ready
+                && after.can_generate_candidates.ready
+                && after.can_generate_coupons.ready
+        );
+        assert_eq!(count(&c), counts);
+        assert_eq!(
+            c.query_row::<String, _, _>(
+                "SELECT json_group_array(feature_json) FROM feature_sets",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            snapshots
+        );
+        drop(c);
+        let reopened = Database::open(db.path().to_path_buf()).unwrap();
+        let mut persisted = read_manifest(&path);
+        let attempts = persisted.attempts;
+        run_attempt(&reopened, dir.path(), &path, &mut persisted).unwrap();
+        assert_eq!(persisted.attempts, attempts);
+        let c = reopened.connection().unwrap();
+        assert_eq!(count(&c), counts);
+        assert_eq!(
+            data_center::status(&c, &runtime, chrono::Utc::now())
+                .unwrap()
+                .core_ready_count,
+            10
+        );
+    }
+
+    #[test]
+    #[ignore = "controlled desktop export; set ARZ_OFFICE_ACCEPTANCE_DIR"]
+    fn export_office_readiness_fixture() {
+        let root = PathBuf::from(std::env::var("ARZ_OFFICE_ACCEPTANCE_DIR").unwrap());
+        fs::create_dir_all(&root).unwrap();
+        let db = office_fixture(&root);
+        let runtime = historical_runtime(&db).unwrap();
+        let before =
+            data_center::status(&db.connection().unwrap(), &runtime, chrono::Utc::now()).unwrap();
+        assert_eq!(before.core_ready_count, 7);
+        fs::write(
+            root.join("before-readiness.json"),
+            serde_json::to_vec_pretty(&before).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("automatic-refresh-settings.json"),
+            r#"{"enabled":false,"interval_seconds":300}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn office_readiness_generates_missing_dependencies_and_reuses_valid_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = office_fixture(dir.path());
+        let c = db.connection().unwrap();
+        c.execute("DELETE FROM daily_output_publications", [])
+            .unwrap();
+        // A newly resolved supported fixture has no prediction or feature snapshot.
+        c.execute("INSERT INTO matches(competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) SELECT competition_id,season,home_team_id,away_team_id,strftime('%Y-%m-%dT%H:%M:%SZ',kickoff_at,'+15 minutes'),status,scheduled_local_date,kickoff_time_known FROM matches WHERE status='scheduled' LIMIT 1", []).unwrap();
+        let id = c.last_insert_rowid();
+        c.execute("INSERT INTO provider_match_mappings(provider,external_match_id,match_id) VALUES('iddaa','new-office-fixture',?1)",[id]).unwrap();
+        current_flow::repair_readiness_dependencies(&c).unwrap();
+        assert!(features::current_snapshot_ready(&c, id).unwrap());
+        assert!(c.query_row::<bool,_,_>("SELECT EXISTS(SELECT 1 FROM predictions WHERE match_id=?1 AND public_probability IS NOT NULL)",[id],|r|r.get(0)).unwrap());
+        let first = crate::repositories::daily_selections::get(&c, &crate::business_clock::date())
+            .unwrap()
+            .publication
+            .id;
+        let counts: (i64,i64) = c.query_row("SELECT (SELECT count(*) FROM candidate_engine_runs),(SELECT count(*) FROM phase8_coupons)",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        current_flow::repair_readiness_dependencies(&c).unwrap();
+        assert_eq!(
+            crate::repositories::daily_selections::get(&c, &crate::business_clock::date())
+                .unwrap()
+                .publication
+                .id,
+            first
+        );
+        assert_eq!(c.query_row::<(i64,i64),_,_>("SELECT (SELECT count(*) FROM candidate_engine_runs),(SELECT count(*) FROM phase8_coupons)",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap(),counts);
+        // A later failed refresh is diagnostic, not proof that the valid publication vanished.
+        c.execute("INSERT INTO daily_refresh_audit(business_date,started_at,status,error) VALUES(?1,?2,'FAILED','TRANSIENT_REFRESH_FAILURE')",rusqlite::params![crate::business_clock::date(),chrono::Utc::now().to_rfc3339()]).unwrap();
+        drop(c);
+        let runtime = historical_runtime(&db).unwrap();
+        assert_eq!(
+            data_center::status(&db.connection().unwrap(), &runtime, chrono::Utc::now())
+                .unwrap()
+                .core_ready_count,
+            10
+        );
+    }
+
+    #[test]
+    fn office_readiness_validates_snapshot_identity_and_conservative_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = office_fixture(dir.path());
+        let c = db.connection().unwrap();
+        let id = current_flow::production_matches(&c, &chrono::Utc::now().to_rfc3339()).unwrap()[0];
+        let mut wrong = features::generate(&c, id).unwrap();
+        wrong.home_team_id += 10000;
+        c.execute("INSERT INTO production_feature_revisions(match_id,feature_engine_version,cutoff_at,feature_json,data_quality_json) VALUES(?1,?2,?3,?4,?5)",rusqlite::params![id,wrong.feature_engine_version,wrong.cutoff_at,serde_json::to_string(&wrong).unwrap(),serde_json::to_string(&wrong.data_quality).unwrap()]).unwrap();
+        assert!(!features::current_snapshot_ready(&c, id).unwrap());
+        assert!(features::ensure_current_snapshot(&c, id).unwrap());
+        assert!(features::current_snapshot_ready(&c, id).unwrap());
+        assert!(!features::ensure_current_snapshot(&c, id).unwrap());
+        c.execute("UPDATE matches SET kickoff_time_known=0 WHERE id=?1", [id])
+            .unwrap();
+        assert!(!features::current_snapshot_ready(&c, id).unwrap());
+        assert!(features::ensure_current_snapshot(&c, id).unwrap());
+        assert!(features::current_snapshot_ready(&c, id).unwrap());
+        assert!(c
+            .execute("UPDATE feature_sets SET feature_json='{}'", [])
+            .is_err());
+        assert!(c
+            .execute("DELETE FROM production_feature_revisions", [])
+            .is_err());
+    }
 
     #[test]
     fn empty_app_data_is_detected_as_pending() {

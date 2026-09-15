@@ -1,6 +1,7 @@
 import type { CompoundSearch, CompoundSeries } from "../types";
 export function katlamaStatus(series: CompoundSeries | null, date: string, ready: boolean, search: CompoundSearch | null): string {
   if (!series || series.status !== "ACTIVE") return "Seri başlatılmadı";
+  if (series.manually_reset) return "Seri manuel olarak sıfırlandı";
   const pending = series.history.find(step => step.result === "UNSETTLED");
   if (pending) return pending.business_date !== date ? "Önceki sonuç henüz kesinleşmedi" : ready ? "Aktif seri · seçimler sonuç bekliyor" : "Aktif adımın sonucu bekleniyor";
   if (search && !search.chosen) return search.reason === "SEARCH_LIMIT_REACHED" ? "Katlama kombinasyon araması tamamlanamadı" : "Bugün uygun Katlama kombinasyonu bulunamadı";

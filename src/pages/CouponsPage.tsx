@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { publishedDailyCoupons, couponTypeOrder } from "../lib/readyCoupons";
 import { katlamaStatus } from "../lib/katlamaStatus";
 import { useBusinessDate } from "../hooks/useBusinessDate";
@@ -50,11 +50,31 @@ function CouponCard({ coupon, matches }: { coupon: Coupon; matches: UpcomingMatc
 }
 function CompoundStatus({ date, series, ready, search, onChange }: { date: string; series: CompoundSeries | null; ready: boolean; search: CompoundSearch | null; onChange: () => void }) {
   const [stake, setStake] = useState("100"), [busy, setBusy] = useState(false), [error, setError] = useState("");
+  const [confirmReset, setConfirmReset] = useState(false);
+  const operation = useRef(false);
+  async function reset() {
+    if (operation.current || !series) return;
+    operation.current = true; setBusy(true); setError("");
+    try { await api.resetCompound(series.id); setConfirmReset(false); onChange(); }
+    catch (e) { setError(String(e)); }
+    finally { operation.current = false; setBusy(false); }
+  }
   const pending = series?.history.some(s => s.result === "UNSETTLED") ?? false;
-  async function act() { setBusy(true); setError(""); try { if (!series || series.status !== "ACTIVE") await api.startCompound(date, Math.round(Number(stake) * 100)); else await api.generateCompound(date); onChange(); } catch (e) { setError(e instanceof Error && e.message === "NO_QUALIFYING_COMPOUND_COUPON" ? "Bugün uygun Katlama kombinasyonu bulunamadı" : String(e)); } finally { setBusy(false); } }
+  async function act() { if (operation.current) return; operation.current = true; setBusy(true); setError(""); try { if (!series || series.status !== "ACTIVE") await api.startCompound(date, Math.round(Number(stake) * 100)); else await api.generateCompound(date); onChange(); } catch (e) { setError(e instanceof Error && e.message === "NO_QUALIFYING_COMPOUND_COUPON" ? "Bugün uygun Katlama kombinasyonu bulunamadı" : String(e)); } finally { operation.current = false; setBusy(false); } }
   return <section className="daily-katlama" aria-label="Katlama durumu"><div className="daily-katlama-icon" aria-hidden="true">↗</div><div className="daily-katlama-title"><h2>Katlama <span>Adım {series?.current_step ?? 1} / 7</span></h2><p data-katlama-state>{katlamaStatus(series, date, ready, search)}</p></div><div className="daily-katlama-steps" aria-hidden="true">{Array.from({ length: 7 }, (_, i) => <i key={i} className={i < (series?.current_step ?? 1) ? "active" : ""} />)}</div>
     {series?.status === "ACTIVE" && <div className="daily-katlama-stake"><small>Devreden tutar</small><strong>{money(series.current_stake_cents)}</strong></div>}<details className="daily-katlama-actions"><summary>{series?.status === "ACTIVE" ? "Seri ayrıntıları" : "Seriyi başlat"}</summary><div>
       {(!series || series.status !== "ACTIVE") && <label>Başlangıç tutarı <input aria-label="Katlama başlangıç tutarı" type="number" min="1" value={stake} onChange={e => setStake(e.target.value)} /></label>}<p>2–3 seçim · hedef oran 1,80. Kesinleşen sonuç sonrası adım otomatik hazırlanır.</p>
       <button className="button secondary" disabled={busy || pending || !Number.isFinite(Number(stake)) || Number(stake) <= 0} onClick={act}>{busy ? "İşleniyor…" : series?.status === "ACTIVE" ? "Adım kuponunu kontrol et" : "Seriyi başlat"}</button>{series && <p>Başlangıç {money(series.starting_stake_cents)} · {series.history.length} kayıtlı adım</p>}{series?.history.map(s => <p key={s.coupon_id}>{s.business_date} · Adım {s.step_number} · {s.result === "UNSETTLED" ? "Sonuç bekleniyor" : s.result}</p>)}{error && <p role="alert">{error}</p>}
-    </div></details></section>;
+    </div></details>
+    {series && <button className="button secondary" disabled={busy} onClick={() => { setError(""); setConfirmReset(true); }}>Katlama serisini sıfırla</button>}
+    {confirmReset && <div role="alertdialog" aria-labelledby="katlama-reset-title" className="katlama-reset-confirm">
+      <h3 id="katlama-reset-title">Katlama serisini sıfırla</h3>
+      <p>Mevcut Katlama serisi Adım 1/7 olarak sıfırlanacak. Yeni seri başlangıç tutarı {money(series?.starting_stake_cents ?? 0)} olacak.</p>
+      <p>Geçmiş kupon kayıtları silinmeyecek. Kesinleşmiş sonuçlar Kupon Performansı’nda kalacak; bakiye, geçmiş ve denetim kayıtları korunacak.</p>
+      <p>Geçerli bir kombinasyon varsa bir sonraki normal yenilemede yeni bir Adım 1 Katlama kuponu üretilebilir.</p>
+      <button className="button secondary" disabled={busy} onClick={() => setConfirmReset(false)}>Vazgeç</button>
+      <button className="button" disabled={busy} onClick={reset}>{busy ? "Sıfırlanıyor…" : "Onayla ve sıfırla"}</button>
+      {error && <p role="alert">{error}</p>}
+    </div>}
+    </section>;
 }

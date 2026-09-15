@@ -201,13 +201,6 @@ pub fn status(
         )
         .map_err(|e| e.to_string())?;
     let business_date = now.with_timezone(&Istanbul).date_naive().to_string();
-    let predictions_today: i64 = c
-        .query_row(
-            "SELECT COUNT(*) FROM predictions p JOIN matches m ON m.id=p.match_id WHERE m.scheduled_local_date=?1",
-            [&business_date],
-            |x| x.get(0),
-        )
-        .map_err(|e| e.to_string())?;
     let finished:i64=c.query_row("SELECT COUNT(*) FROM matches WHERE status='finished' AND final_home_goals IS NOT NULL AND final_away_goals IS NOT NULL",[],|x|x.get(0)).map_err(|e|e.to_string())?;
     let latest_import:Option<String>=c.query_row("SELECT MAX(completed_at) FROM data_import_runs WHERE provider='football-data.co.uk' AND status='completed'",[],|x|x.get(0)).map_err(|e|e.to_string())?;
     let latest_iddaa_error:Option<String>=c.query_row("SELECT error_message FROM data_import_runs WHERE provider='iddaa' AND status='failed' ORDER BY completed_at DESC,id DESC LIMIT 1",[],|x|x.get(0)).optional().map_err(|e|e.to_string())?.flatten();
@@ -244,8 +237,15 @@ pub fn status(
     // A mapped competition is only model-supported when both canonical team
     // identities and the minimum model history are available. Catalog/live
     // events outside that universe remain diagnostic and never block readiness.
-    let (production_events, history_missing, features_missing): (i64,i64,i64) = c.query_row(
-        "WITH production AS (SELECT m.* FROM matches m WHERE m.status='scheduled' AND julianday(m.kickoff_at)>julianday(?1) AND EXISTS(SELECT 1 FROM provider_match_mappings p WHERE p.match_id=m.id AND p.provider='iddaa') AND EXISTS(SELECT 1 FROM provider_competition_mappings p WHERE p.competition_id=m.competition_id AND p.provider='football-data.co.uk') AND EXISTS(SELECT 1 FROM provider_team_mappings p WHERE p.team_id=m.home_team_id AND p.provider='football-data.co.uk') AND EXISTS(SELECT 1 FROM provider_team_mappings p WHERE p.team_id=m.away_team_id AND p.provider='football-data.co.uk') AND (SELECT count(*) FROM matches h WHERE h.status='finished' AND h.kickoff_at<m.kickoff_at AND (h.home_team_id=m.home_team_id OR h.away_team_id=m.home_team_id))>=5 AND (SELECT count(*) FROM matches h WHERE h.status='finished' AND h.kickoff_at<m.kickoff_at AND (h.home_team_id=m.away_team_id OR h.away_team_id=m.away_team_id))>=5) SELECT count(*),0,COALESCE(sum(NOT EXISTS(SELECT 1 FROM feature_sets f WHERE f.match_id=m.id AND f.feature_engine_version='fe_v1' AND json_valid(f.feature_json))),0) FROM production m",[now.to_rfc3339()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(|e|e.to_string())?;
+    let production_ids = super::current_flow::production_matches(c, &now.to_rfc3339())?;
+    let production_events = production_ids.len() as i64;
+    let history_missing = 0;
+    let mut features_missing = 0_i64;
+    for id in &production_ids {
+        if !features::current_snapshot_ready(c, *id)? {
+            features_missing += 1;
+        }
+    }
     let (logos_ready,_logos_failed,logo_bytes,logo_last):(i64,i64,i64,Option<String>)=c.query_row("SELECT SUM(CASE WHEN entity_type='TEAM' AND status='READY' THEN 1 ELSE 0 END),SUM(CASE WHEN entity_type='TEAM' AND status='FAILED' THEN 1 ELSE 0 END),SUM(CASE WHEN entity_type='TEAM' AND status='READY' THEN COALESCE(byte_size,0) ELSE 0 END),MAX(CASE WHEN entity_type='TEAM' THEN updated_at END) FROM entity_assets",[],|x|Ok((x.get::<_,Option<i64>>(0)?.unwrap_or(0),x.get::<_,Option<i64>>(1)?.unwrap_or(0),x.get::<_,Option<i64>>(2)?.unwrap_or(0),x.get(3)?))).map_err(|e|e.to_string())?;
     let active_model:Option<(String,Option<String>,Option<String>)>=c.query_row("SELECT version_identifier,artifact_sha256,feature_engine_version FROM model_versions WHERE is_active=1",[],|x|Ok((x.get(0)?,x.get(1)?,x.get(2)?))).optional().map_err(|e|e.to_string())?;
     let calibration_row:Option<(String,String,String,String)>=c.query_row("SELECT calibration_version,parent_model_version,parent_artifact_sha256,artifact_path FROM calibration_models WHERE is_active=1",[],|x|Ok((x.get(0)?,x.get(1)?,x.get(2)?,x.get(3)?))).optional().map_err(|e|e.to_string())?;
@@ -576,12 +576,7 @@ pub fn status(
         global_unresolved - blocking_unresolved,
     );
     let mut features = item(
-        if scope.ready()
-            && features_missing == 0
-            && (production_events == 0
-                || (feature.features_generated > 0
-                    && feature.insufficient_history < feature.features_generated))
-        {
+        if scope.ready() && features_missing == 0 {
             ReadinessState::Ready
         } else if feature.features_generated > 0 {
             ReadinessState::Partial
@@ -750,10 +745,16 @@ pub fn status(
         (&prediction_model, "Aktif model hazır değil."),
         (&calibration, "Kalibrasyon hazır değil."),
     ]);
-    let production_today: i64 = c.query_row("SELECT COUNT(*) FROM matches m WHERE m.scheduled_local_date=?1 AND m.status='scheduled' AND EXISTS(SELECT 1 FROM provider_match_mappings pm WHERE pm.match_id=m.id AND pm.provider='iddaa') AND EXISTS(SELECT 1 FROM provider_competition_mappings cp WHERE cp.competition_id=m.competition_id AND cp.provider='football-data.co.uk')", [&business_date], |row| row.get(0)).map_err(|error| error.to_string())?;
+    let mut missing_predictions = 0;
+    for id in &production_ids {
+        let valid: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM predictions p JOIN model_versions mv ON mv.id=p.model_version_id AND mv.is_active=1 WHERE p.match_id=?1 AND p.public_probability IS NOT NULL)", [id], |r|r.get(0)).map_err(|e|e.to_string())?;
+        if !valid {
+            missing_predictions += 1;
+        }
+    }
     let can_generate_candidates = if can_generate_predictions.ready {
         let mut gate = capable(&[(&iddaa, "Güncel bülten yok."), (&odds, "Güncel oran yok.")]);
-        if predictions_today == 0 && production_today > 0 {
+        if missing_predictions > 0 {
             gate.ready = false;
             gate.reasons.push("Henüz kalıcı tahmin bulunmuyor.".into())
         }
@@ -775,9 +776,7 @@ pub fn status(
             reasons: vec!["Önce aday hazırlığı tamamlanmalı.".into()],
         }
     };
-    let publication = super::daily_selections::publication(c, &business_date)
-        .and_then(|p| super::daily_selections::view(c, &p));
-    let published_coupons = super::coupon_engine::get_daily(c, &business_date, None);
+    let publication = super::daily_selections::get(c, &business_date);
     let mut can_generate_candidates = can_generate_candidates;
     if let Err(ref error) = publication {
         can_generate_candidates.ready = false;
@@ -786,14 +785,14 @@ pub fn status(
             .push(format!("Günlük aday yayını okunamıyor: {error}"));
     }
     let mut can_generate_coupons = can_generate_coupons;
-    if !can_generate_candidates.ready || published_coupons.is_err() {
+    if !can_generate_candidates.ready || publication.is_err() {
         can_generate_coupons.ready = false;
         can_generate_coupons
             .reasons
             .push("Aday/kupon kaynağı doğrulanamadı.".into());
     }
     let pipeline_failure:Option<String>=c.query_row("SELECT error FROM daily_refresh_audit WHERE business_date=?1 AND status='FAILED' AND id=(SELECT max(id) FROM daily_refresh_audit WHERE business_date=?1)",[&business_date],|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-    if let Some(error) = pipeline_failure {
+    if let Some(error) = pipeline_failure.filter(|_| publication.is_err()) {
         can_generate_candidates.ready = false;
         can_generate_candidates
             .reasons

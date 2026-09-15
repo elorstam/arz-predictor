@@ -152,6 +152,7 @@ pub fn run() {
             commands::coupon_engine_get_daily,
             commands::compound_series_start,
             commands::compound_series_status,
+            commands::compound_series_manual_reset,
             commands::compound_series_settle_step,
             commands::coupon_engine_settle,
             commands::compound_series_generate_step,

@@ -1275,6 +1275,7 @@ pub struct CompoundSeries {
     pub completed_steps: usize,
     pub latest_coupon_id: Option<i64>,
     pub reset_count: usize,
+    pub manually_reset: bool,
     pub history: Vec<CompoundSeriesStep>,
 }
 pub fn start_series(c: &Connection, date: &str, stake: i64) -> Result<CompoundSeries, String> {
@@ -1294,8 +1295,29 @@ pub fn start_series(c: &Connection, date: &str, stake: i64) -> Result<CompoundSe
     c.execute("INSERT INTO phase8_compound_series(business_date,status,current_step,starting_stake_cents,current_stake_cents,metadata_json) VALUES(?1,'ACTIVE',1,?2,?2,'{}')",params![date,stake]).map_err(|e|e.to_string())?;
     series(c, c.last_insert_rowid())
 }
+/// Reset only progression. Old coupons and their financial/settlement records stay attached
+/// to the archived series. The expected ID makes retries safe even after publication.
+pub fn manual_reset_series(c: &Connection, expected_id: i64) -> Result<CompoundSeries, String> {
+    let tx = rusqlite::Transaction::new_unchecked(c, rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| e.to_string())?;
+    let current = series_status(&tx)?.ok_or("NO_ACTIVE_SERIES")?;
+    let successor: Option<i64> = tx.query_row(
+        "SELECT id FROM phase8_compound_series WHERE json_extract(metadata_json,'$.manual_reset_from_series_id')=?1 ORDER BY id DESC LIMIT 1",
+        [expected_id], |r| r.get(0)).optional().map_err(|e| e.to_string())?;
+    if successor.is_some() || (current.id == expected_id && current.manually_reset) {
+        return Ok(current);
+    }
+    if current.id != expected_id {
+        return Err("SERIES_CHANGED_REFRESH_AND_RETRY".into());
+    }
+    tx.execute("UPDATE phase8_compound_series SET status='CANCELLED',metadata_json=json_set(metadata_json,'$.closed_reason','MANUAL_RESET','$.manual_reset_at',strftime('%Y-%m-%dT%H:%M:%fZ','now')) WHERE id=?1", [current.id]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT INTO phase8_compound_series(business_date,status,current_step,starting_stake_cents,current_stake_cents,reset_count,metadata_json) VALUES(?1,'ACTIVE',1,?2,?2,?3,json_object('last_reason','MANUAL_RESET','manual_reset_from_series_id',?4,'manual_reset_at',strftime('%Y-%m-%dT%H:%M:%fZ','now')))", params![crate::business_clock::date(),current.starting_stake_cents,current.reset_count+1,current.id]).map_err(|e| e.to_string())?;
+    let result = series(&tx, tx.last_insert_rowid())?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
 pub fn series(c: &Connection, id: i64) -> Result<CompoundSeries, String> {
-    let mut value=c.query_row("SELECT id,business_date,status,current_step,starting_stake_cents,current_stake_cents,completed_steps,latest_coupon_id,reset_count FROM phase8_compound_series WHERE id=?1",[id],|x|Ok(CompoundSeries{id:x.get(0)?,business_date:x.get(1)?,status:x.get(2)?,current_step:x.get::<_,i64>(3)? as usize,starting_stake_cents:x.get(4)?,current_stake_cents:x.get(5)?,completed_steps:x.get::<_,i64>(6)? as usize,latest_coupon_id:x.get(7)?,reset_count:x.get::<_,i64>(8)? as usize,history:Vec::new()})).map_err(|e|e.to_string())?;
+    let mut value=c.query_row("SELECT id,business_date,status,current_step,starting_stake_cents,current_stake_cents,completed_steps,latest_coupon_id,reset_count,COALESCE(json_extract(metadata_json,'$.last_reason')='MANUAL_RESET' AND latest_coupon_id IS NULL,0) FROM phase8_compound_series WHERE id=?1",[id],|x|Ok(CompoundSeries{id:x.get(0)?,business_date:x.get(1)?,status:x.get(2)?,current_step:x.get::<_,i64>(3)? as usize,starting_stake_cents:x.get(4)?,current_stake_cents:x.get(5)?,completed_steps:x.get::<_,i64>(6)? as usize,latest_coupon_id:x.get(7)?,reset_count:x.get::<_,i64>(8)? as usize,manually_reset:x.get(9)?,history:Vec::new()})).map_err(|e|e.to_string())?;
     let mut statement=c.prepare("SELECT step_number,coupon_id,business_date,stake_cents,combined_odd,result,settled_at FROM phase8_series_steps WHERE series_id=?1 ORDER BY id").map_err(|e|e.to_string())?;
     value.history = statement
         .query_map([id], |row| {

@@ -4,6 +4,11 @@ import type { CompoundSearch, CompoundSeries } from "../types";
 const search = { chosen: null, reason: "NO_VALID_COMBINATION" } as CompoundSearch;
 const series = (result: string, step = 2): CompoundSeries => ({ id: 1, business_date: "2026-09-13", status: "ACTIVE", current_step: step, starting_stake_cents: 10000, current_stake_cents: 16900, completed_steps: step - 1, latest_coupon_id: 1, reset_count: 0, history: [{ coupon_id: 1, step_number: 1, business_date: "2026-09-13", result, settled_at: null, stake_cents: 10000, combined_odd: 1.69 }] });
 describe("Katlama settlement labels", () => {
+  it("keeps manual reset visible until a new coupon is published", () => {
+    const reset = { ...series("WON", 1), manually_reset: true, latest_coupon_id: null, history: [] };
+    expect(katlamaStatus(reset, "2026-09-14", true, search)).toBe("Seri manuel olarak sıfırlandı");
+    expect(katlamaStatus({ ...series("UNSETTLED", 1), manually_reset: false }, "2026-09-13", true, search)).toBe("Aktif seri · seçimler sonuç bekliyor");
+  });
   it.each(["WON", "LOST", "VOID"])("does not show false pending after %s without a combination", result => {
     expect(katlamaStatus(series(result), "2026-09-14", false, search)).toBe("Bugün uygun Katlama kombinasyonu bulunamadı");
   });

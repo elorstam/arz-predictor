@@ -299,7 +299,7 @@ fn katlama(
     from: Option<NaiveDate>,
     to: NaiveDate,
 ) -> Result<KatlamaSummary, String> {
-    let mut q = c.prepare("SELECT s.series_id,s.step_number,s.business_date,s.stake_cents,s.result,COALESCE(json_extract(p.metadata_json,'$.settlement.gross_return_cents'),0) FROM phase8_series_steps s JOIN phase8_coupons p ON p.id=s.coupon_id JOIN phase8_compound_series cs ON cs.id=s.series_id WHERE cs.status<>'CANCELLED' ORDER BY s.series_id,s.id").map_err(|e|e.to_string())?;
+    let mut q = c.prepare("SELECT s.series_id,s.step_number,s.business_date,s.stake_cents,s.result,COALESCE(json_extract(p.metadata_json,'$.settlement.gross_return_cents'),0) FROM phase8_series_steps s JOIN phase8_coupons p ON p.id=s.coupon_id JOIN phase8_compound_series cs ON cs.id=s.series_id WHERE (cs.status<>'CANCELLED' OR json_extract(cs.metadata_json,'$.closed_reason')='MANUAL_RESET') ORDER BY s.series_id,s.id").map_err(|e|e.to_string())?;
     let steps = q
         .query_map([], |r| {
             Ok((

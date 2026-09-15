@@ -31,7 +31,7 @@ fn universe() -> (Database, i64, i64, i64, i64, i64, Vec<i64>) {
         c.query_row::<i64, _, _>("SELECT MAX(version) FROM schema_migrations", [], |r| r
             .get(0))
             .unwrap(),
-        32
+        33
     );
     let comp =
         competitions::insert(&c, "Premier League", Some("England"), Some("2026/27")).unwrap();

@@ -402,6 +402,159 @@ fn export_katlama_desktop_scenarios() {
 }
 
 #[test]
+fn manual_reset_preserves_history_restart_and_normal_publication() {
+    for settled in [false, true] {
+        let (db, id) = katlama_live_fixture(false, 4);
+        let c = db.connection().unwrap();
+        let old_coupon = coupon_engine::series(&c, id)
+            .unwrap()
+            .latest_coupon_id
+            .unwrap();
+        if settled {
+            c.execute("UPDATE matches SET status='finished',final_home_goals=2,final_away_goals=1 WHERE id IN (SELECT match_id FROM phase8_coupon_selections WHERE coupon_id=?1)", [old_coupon]).unwrap();
+            super::coupon_settlement::run(&c).unwrap();
+        }
+        let before = coupon_engine::get_coupon(&c, old_coupon).unwrap();
+        let history = coupon_engine::series(&c, id).unwrap().history;
+        let snapshot = |c: &rusqlite::Connection| -> Vec<String> {
+            [
+                "phase8_coupons",
+                "phase8_coupon_selections",
+                "phase8_series_steps",
+                "compound_transition_audit",
+                "coupon_selection_settlement_audit",
+            ]
+            .iter()
+            .map(|table| {
+                let mut q = c
+                    .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+                    .unwrap();
+                let columns = q.column_count();
+                let rows = q
+                    .query_map([], |r| {
+                        Ok((0..columns)
+                            .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                            .collect::<Vec<_>>())
+                    })
+                    .unwrap();
+                format!("{:?}", rows.collect::<Result<Vec<_>, _>>().unwrap())
+            })
+            .collect()
+        };
+        let performance_request = super::coupon_performance::CouponPerformanceRequest {
+            window: super::model_performance::PerformanceWindow::AllTime,
+            coupon_type: None,
+            as_of: None,
+            include_system: None,
+            include_katlama: None,
+        };
+        let performance = super::coupon_performance::get(&c, &performance_request).unwrap();
+        let records = snapshot(&c);
+        let reset = coupon_engine::manual_reset_series(&c, id).unwrap();
+        assert_eq!(reset.current_step, 1);
+        assert_eq!(reset.completed_steps, 0);
+        assert_eq!(reset.current_stake_cents, reset.starting_stake_cents);
+        assert!(
+            reset.manually_reset && reset.history.is_empty() && reset.latest_coupon_id.is_none()
+        );
+        assert_eq!(snapshot(&c), records);
+        assert_eq!(
+            super::coupon_performance::get(&c, &performance_request).unwrap(),
+            performance
+        );
+        assert_eq!(coupon_engine::series(&c, id).unwrap().history, history);
+        assert_eq!(coupon_engine::manual_reset_series(&c, id).unwrap(), reset);
+        assert_eq!(
+            coupon_engine::manual_reset_series(&c, reset.id).unwrap(),
+            reset
+        );
+        assert_eq!(snapshot(&c), records);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reset.sqlite3");
+        c.execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+            .unwrap();
+        let reopened = Database::open(path).unwrap();
+        let rc = reopened.connection().unwrap();
+        assert_eq!(
+            coupon_engine::series_status(&rc).unwrap(),
+            Some(reset.clone())
+        );
+        assert_eq!(snapshot(&rc), records);
+        super::current_flow::run(&rc).unwrap();
+        let published = coupon_engine::series_status(&rc).unwrap().unwrap();
+        assert_eq!(published.current_step, 1);
+        assert_eq!(published.history.len(), 1);
+        assert!(!published.manually_reset);
+        let next = coupon_engine::get_coupon(&rc, published.latest_coupon_id.unwrap()).unwrap();
+        assert_eq!(next.step_number, Some(1));
+        assert_ne!(next.id, old_coupon);
+        assert!((2..=3).contains(&next.selections.len()));
+        assert_eq!(coupon_engine::get_coupon(&rc, old_coupon).unwrap(), before);
+        super::current_flow::run(&rc).unwrap();
+        assert_eq!(
+            coupon_engine::series_status(&rc).unwrap(),
+            Some(published.clone())
+        );
+        assert_eq!(
+            coupon_engine::manual_reset_series(&rc, id).unwrap(),
+            published
+        );
+    }
+}
+
+#[test]
+fn manual_reset_without_valid_combination_does_not_publish() {
+    let (db, id) = katlama_live_fixture(true, 4);
+    let c = db.connection().unwrap();
+    let reset = coupon_engine::manual_reset_series(&c, id).unwrap();
+    super::current_flow::run(&c).unwrap();
+    assert_eq!(coupon_engine::series_status(&c).unwrap(), Some(reset));
+}
+
+#[test]
+fn manual_reset_errors_roll_back_the_entire_operation() {
+    let (db, id) = katlama_live_fixture(false, 4);
+    let c = db.connection().unwrap();
+    let before = coupon_engine::series(&c, id).unwrap();
+    assert_eq!(
+        coupon_engine::manual_reset_series(&c, id + 100).unwrap_err(),
+        "SERIES_CHANGED_REFRESH_AND_RETRY"
+    );
+    c.execute_batch("CREATE TEMP TRIGGER reject_reset BEFORE INSERT ON phase8_compound_series BEGIN SELECT RAISE(ABORT,'RESET_STORAGE_ERROR'); END;").unwrap();
+    assert!(coupon_engine::manual_reset_series(&c, id)
+        .unwrap_err()
+        .contains("RESET_STORAGE_ERROR"));
+    assert_eq!(coupon_engine::series_status(&c).unwrap(), Some(before));
+}
+
+#[test]
+#[ignore = "controlled real desktop export; set ARZ_MANUAL_RESET_ACCEPTANCE_DIR"]
+fn export_manual_reset_desktop() {
+    let root = std::path::PathBuf::from(std::env::var("ARZ_MANUAL_RESET_ACCEPTANCE_DIR").unwrap());
+    std::fs::create_dir_all(&root).unwrap();
+    let (db, id) = katlama_live_fixture(false, 3);
+    let c = db.connection().unwrap();
+    let coupon = coupon_engine::series(&c, id)
+        .unwrap()
+        .latest_coupon_id
+        .unwrap();
+    c.execute("UPDATE matches SET status='finished',final_home_goals=2,final_away_goals=1 WHERE id IN (SELECT match_id FROM phase8_coupon_selections WHERE coupon_id=?1)", [coupon]).unwrap();
+    super::coupon_settlement::run(&c).unwrap();
+    assert_eq!(coupon_engine::series(&c, id).unwrap().current_step, 4);
+    c.execute(
+        "VACUUM INTO ?1",
+        [root.join("football-predictor.sqlite3").to_str().unwrap()],
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("automatic-refresh-settings.json"),
+        r#"{"enabled":false,"interval_seconds":300}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("first-run-bootstrap.json"),serde_json::json!({"version":crate::first_run::BOOTSTRAP_VERSION,"completed":[],"reports":{},"durations_ms":{},"started_at":"2026-09-15T00:00:00Z","completed_at":"2026-09-15T00:00:00Z","attempts":1,"error":null}).to_string()).unwrap();
+}
+
+#[test]
 fn automatic_coupon_outcome_without_stake_never_invents_realized_money() {
     let db = fixture();
     let c = db.connection().unwrap();

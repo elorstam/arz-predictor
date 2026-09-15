@@ -943,6 +943,14 @@ pub fn compound_series_start(
     )
 }
 #[tauri::command]
+pub fn compound_series_manual_reset(
+    database: State<'_, Database>,
+    request: SeriesIdRequest,
+) -> Result<crate::repositories::coupon_engine::CompoundSeries, String> {
+    let c = database.connection()?;
+    crate::repositories::coupon_engine::manual_reset_series(&c, request.series_id)
+}
+#[tauri::command]
 pub fn compound_series_status(
     database: State<'_, Database>,
 ) -> Result<Option<crate::repositories::coupon_engine::CompoundSeries>, String> {

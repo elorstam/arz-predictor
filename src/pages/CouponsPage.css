@@ -14,3 +14,7 @@ html:has(.daily-coupons-page),body:has(.daily-coupons-page),#root:has(.daily-cou
 .daily-coupon-technical{margin-top:22px;font-size:11px;color:var(--muted);padding:14px 0;border-top:1px solid var(--border)}.daily-coupon-technical summary{cursor:pointer}.daily-unavailable{display:grid;gap:10px;margin:16px 0}.daily-unavailable>div{display:flex;justify-content:space-between;gap:14px}.daily-coupon-technical details{margin-top:12px}
 @container(max-width:1090px){.daily-coupons-page .coupon-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.daily-katlama-steps{display:none}.daily-katlama-stake{margin-left:auto}}
 @container(max-width:650px){.daily-coupons-page .coupon-grid{grid-template-columns:minmax(0,1fr)}.daily-katlama{flex-wrap:wrap}.daily-katlama-title{flex:1}.daily-katlama-stake{margin-left:50px;border:0;padding:0}.daily-katlama-actions{margin-left:auto}.daily-coupon-heading>span{font-size:10px}}
+
+.katlama-reset-confirm { flex-basis: 100%; padding: 20px; border: 1px solid var(--border); border-radius: 12px; }
+.katlama-reset-confirm .button { margin-right: 12px; }
+.daily-katlama:has(.katlama-reset-confirm) { flex-wrap: wrap; }

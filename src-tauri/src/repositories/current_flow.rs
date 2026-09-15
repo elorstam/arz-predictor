@@ -19,6 +19,48 @@ pub struct FlowReport {
     pub usable_coupons: usize,
 }
 
+/// Same production universe as inference; unsupported/insufficient-history
+/// fixtures remain exclusions rather than blocking the entire installation.
+pub fn production_matches(c: &Connection, now: &str) -> Result<Vec<i64>, String> {
+    let mut q = c.prepare("SELECT m.id FROM matches m WHERE m.status='scheduled' AND julianday(m.kickoff_at)>julianday(?1) AND EXISTS(SELECT 1 FROM provider_match_mappings p WHERE p.match_id=m.id AND p.provider='iddaa') ORDER BY m.kickoff_at,m.id").map_err(|e|e.to_string())?;
+    let ids = q
+        .query_map([now], |r| r.get::<_, i64>(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    ids.into_iter()
+        .filter_map(|id| match model_coverage::classify(c, id) {
+            Ok(
+                model_coverage::CoverageState::ModelSupported
+                | model_coverage::CoverageState::ModelReady,
+            ) => Some(Ok(id)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e.to_string())),
+        })
+        .collect()
+}
+
+/// Resume a recovered bootstrap from live dependencies, not completed-stage flags.
+pub fn repair_readiness_dependencies(c: &Connection) -> Result<(), String> {
+    let ids = production_matches(c, &crate::business_clock::now().to_rfc3339())?;
+    let model: i64 = c
+        .query_row("SELECT id FROM model_versions WHERE is_active=1", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| e.to_string())?;
+    let mut missing_predictions = false;
+    for id in ids {
+        features::ensure_current_snapshot(c, id)?;
+        missing_predictions |= !base_prediction_exists(c, id, model).map_err(|e| e.to_string())?;
+    }
+    if missing_predictions
+        || super::daily_selections::get(c, &crate::business_clock::date()).is_err()
+    {
+        run(c)?;
+    }
+    Ok(())
+}
+
 /// Iddaa owns live fixtures; history comes from safely resolved canonical teams.
 pub fn run(c: &Connection) -> Result<FlowReport, String> {
     run_with_feature_refresh(c, false)
@@ -61,6 +103,7 @@ pub fn run_with_feature_refresh(
             });
             continue;
         }
+        features::ensure_current_snapshot(c, id)?;
         let already = base_prediction_exists(c, id, model_id).map_err(|e| e.to_string())?;
         if already
             && !history_changed
