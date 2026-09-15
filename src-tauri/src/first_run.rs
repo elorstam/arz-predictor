@@ -21,7 +21,7 @@ pub const BOOTSTRAP_VERSION: &str = "bootstrap-v3:arz-base-1.0.2";
 pub const MODEL_VERSION: &str = "arz-base-1.0.2";
 pub const CALIBRATION_VERSION: &str = "arz-base-1.0.2-cal1";
 const REQUIRED_SEASONS: &[&str] = &["2425", "2526"];
-const MODEL_LEAGUES: &[&str] = &["E0", "E1", "SP1", "D1", "I1", "F1", "N1", "P1", "B1", "T1"];
+use crate::repositories::production_scope::{self, MODEL_LEAGUES};
 const STAGES: &[(&str, &str)] = &[
     ("database", "Veritabanı"),
     ("history", "Geçmiş veri"),
@@ -263,7 +263,8 @@ fn dataset_complete(
         .join("football-data")
         .join(dataset.season_code)
         .join(format!("{}.csv", dataset.league_code));
-    Ok(imported && cache.is_file())
+    let owned: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM matches m JOIN provider_competition_mappings p ON p.competition_id=m.competition_id AND p.provider='football-data.co.uk' WHERE p.external_competition_id=?1 AND m.season=?2 AND m.status='finished' AND EXISTS(SELECT 1 FROM provider_match_mappings h WHERE h.match_id=m.id AND h.provider='football-data.co.uk'))", rusqlite::params![dataset.league_code,dataset.season], |r| r.get(0)).map_err(|e| e.to_string())?;
+    Ok(imported && cache.is_file() && owned)
 }
 
 fn copy_validated(source: &Path, destination: &Path) -> Result<(), String> {
@@ -438,6 +439,10 @@ fn run_attempt(
     manifest_path: &Path,
     manifest: &mut Manifest,
 ) -> Result<(), String> {
+    {
+        let c = database.connection()?;
+        production_scope::repair(&c).map_err(|e| e.to_string())?;
+    }
     if manifest.started_at.is_none() {
         manifest.started_at = Some(chrono::Utc::now().to_rfc3339());
     }
@@ -459,9 +464,12 @@ fn run_attempt(
                     completed += 1;
                     continue;
                 }
-                let imported = tauri::async_runtime::block_on(football_data::refresh_results(
-                    database, dataset,
-                ))?;
+                let imported = match football_data::import_cached_dataset(database, dataset) {
+                    Ok(imported) => imported,
+                    Err(_) => tauri::async_runtime::block_on(football_data::refresh_results(
+                        database, dataset,
+                    ))?,
+                };
                 completed += 1;
                 rows += imported.rows_seen;
                 manifest.reports.insert("history".into(), json!({"completed": completed, "total": datasets.len(), "rows_seen_this_attempt": rows}));
@@ -488,13 +496,27 @@ fn run_attempt(
 
 pub fn start(database_path: PathBuf, resources: PathBuf, app: AppHandle) {
     let path = manifest_path(&database_path);
-    let initial = read_manifest(&path);
+    let mut initial = read_manifest(&path);
+    let scope_ready = Database::open(database_path.clone())
+        .ok()
+        .and_then(|db| {
+            db.connection()
+                .ok()
+                .and_then(|c| production_scope::status(&c).ok())
+        })
+        .is_some_and(|scope| scope.ready());
+    if !scope_ready {
+        initial.completed_at = None;
+        initial
+            .completed
+            .retain(|id| matches!(id.as_str(), "database" | "model" | "calibration"));
+    }
     let _ = STATUS.set(Mutex::new(project(&initial, None, None)));
     if initial.completed_at.is_some() {
         return;
     }
     std::thread::spawn(move || {
-        let mut manifest = read_manifest(&path);
+        let mut manifest = initial;
         let mut failures = 0_u32;
         loop {
             let database = match Database::open(database_path.clone()) {

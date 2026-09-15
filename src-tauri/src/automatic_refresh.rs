@@ -307,6 +307,8 @@ fn cycle(path: PathBuf, app: &tauri::AppHandle) -> Result<Value, String> {
     let settled = coupon_settlement::run(&c)?;
     timings.insert("settlement_ms".into(), json!(t.elapsed().as_millis()));
     let t = Instant::now();
+    let scope_repaired =
+        crate::repositories::production_scope::repair(&c).map_err(|e| e.to_string())?;
     let resolution = incremental_resolution::process(&c, 128).map_err(|e| e.to_string())?;
     timings.insert("resolution_ms".into(), json!(t.elapsed().as_millis()));
     let fingerprint_path = path.with_file_name("automatic-publication-inputs.json");
@@ -327,7 +329,9 @@ fn cycle(path: PathBuf, app: &tauri::AppHandle) -> Result<Value, String> {
         .is_some_and(|epoch| epoch != history_epoch);
     let t = Instant::now();
     let production = if live_ok
-        && (prior["input"].as_str() != Some(input.as_str()) || resolution.resolved > 0)
+        && (prior["input"].as_str() != Some(input.as_str())
+            || resolution.resolved > 0
+            || scope_repaired > 0)
     {
         match current_flow::run_with_feature_refresh(&c, history_changed) {
             Ok(report) => {

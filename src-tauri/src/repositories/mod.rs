@@ -44,6 +44,7 @@ pub mod popularity;
 pub mod prediction_engine;
 #[cfg(test)]
 mod prediction_engine_tests;
+pub mod production_scope;
 pub mod quality;
 pub mod resolution;
 pub mod stats;

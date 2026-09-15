@@ -181,6 +181,7 @@ pub fn status(
     now: DateTime<Utc>,
 ) -> Result<DataCenterStatus, String> {
     let bulletin = iddaa::bulletin_status(c).map_err(|e| e.to_string())?;
+    let scope = super::production_scope::status(c).map_err(|e| e.to_string())?;
     let popular = popularity::status(c).map_err(|e| e.to_string())?;
     let feature = features::quality_summary(c)?;
     let engine = prediction_engine::status(c).unwrap_or(prediction_engine::EngineStatus {
@@ -267,7 +268,8 @@ pub fn status(
         false,
         None,
     );
-    let historical_ok = finished >= prediction_engine::MIN_TRAINING_SAMPLES as i64
+    let historical_ok = scope.ready()
+        && finished >= prediction_engine::MIN_TRAINING_SAMPLES as i64
         && runtime.historical_imported_count > 0
         && history_missing == 0;
     let historical_state = if historical_ok {
@@ -324,6 +326,22 @@ pub fn status(
     ]);
     // Catalog coverage is diagnostic, never the production readiness denominator.
     historical_data.progress = None;
+    historical_data
+        .metrics
+        .insert("supported_competitions".into(), scope.registered as i64);
+    historical_data.metrics.insert(
+        "required_supported_competitions".into(),
+        scope.required as i64,
+    );
+    historical_data.metrics.insert(
+        "production_history_matches".into(),
+        scope.historical_matches,
+    );
+    if !scope.ready() {
+        historical_data.status = ReadinessState::ActionRequired;
+        historical_data.technical_reason = Some("PRODUCTION_SCOPE_BOOTSTRAP_INCOMPLETE".into());
+        historical_data.message = "Üretim kapsamı hazırlanıyor; desteklenen lig kayıtları ve geçmiş bağlantıları henüz tamamlanmadı.".into();
+    }
     historical_data
         .metrics
         .insert("production_events".into(), production_events);
@@ -534,7 +552,7 @@ pub fn status(
         },
     );
     let blocking_unresolved = upcoming_supported - upcoming_resolved;
-    entity_resolution.status = if blocking_unresolved == 0 {
+    entity_resolution.status = if scope.ready() && blocking_unresolved == 0 {
         ReadinessState::Ready
     } else {
         ReadinessState::ActionRequired
@@ -545,6 +563,11 @@ pub fn status(
         format!("{blocking_unresolved} gelecek desteklenen maç eşleştirme bekliyor.")
     };
     entity_resolution.technical_reason=Some(format!("{blocking_unresolved} PRODUCTION_UNRESOLVED; {global_unresolved} REGISTRY_UNRESOLVED; {current_unresolved} TODAY_UNRESOLVED; {pending_resolution_diagnostics} PENDING_DIAGNOSTICS"));
+    if !scope.ready() {
+        entity_resolution.message =
+            "Desteklenen üretim kapsamı ve lig bağlantıları otomatik hazırlanıyor.".into();
+        entity_resolution.technical_reason = Some("PRODUCTION_SCOPE_BOOTSTRAP_INCOMPLETE".into());
+    }
     entity_resolution
         .metrics
         .insert("blocking_unresolved".into(), blocking_unresolved);
@@ -553,7 +576,8 @@ pub fn status(
         global_unresolved - blocking_unresolved,
     );
     let mut features = item(
-        if features_missing == 0
+        if scope.ready()
+            && features_missing == 0
             && (production_events == 0
                 || (feature.features_generated > 0
                     && feature.insufficient_history < feature.features_generated))
@@ -858,7 +882,11 @@ pub fn status(
         .filter(|x| x.status == ReadinessState::Ready)
         .count();
     let core_check_count = core_checks.len();
-    let overall_status = core_overall(&core_checks);
+    let overall_status = if !scope.ready() {
+        ReadinessState::ActionRequired
+    } else {
+        core_overall(&core_checks)
+    };
     Ok(DataCenterStatus {
         core_checks,
         core_ready_count,

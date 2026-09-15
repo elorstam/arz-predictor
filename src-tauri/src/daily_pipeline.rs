@@ -42,6 +42,7 @@ pub fn after_refresh(
     c.execute("INSERT INTO daily_refresh_audit(import_run_id,business_date,started_at,status,ingestion_ms) VALUES(?1,?2,strftime('%Y-%m-%dT%H:%M:%fZ','now'),'RUNNING',?3)",rusqlite::params![import,day,ingestion as i64]).map_err(|e|e.to_string())?;
     let audit = c.last_insert_rowid();
     let result = (|| -> Result<serde_json::Value, String> {
+        crate::repositories::production_scope::repair(&c).map_err(|e| e.to_string())?;
         let resolution = {
             let _guard = PRODUCTION_LOCK
                 .lock()

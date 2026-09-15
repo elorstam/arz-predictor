@@ -137,6 +137,7 @@ fn phase12_freshness_optional_dependencies_and_compatibility_are_explicit() {
 fn phase12_updating_progress_failures_and_json_contract_are_honest() {
     let db = candidate_engine_acceptance_tests::db();
     let c = db.connection().unwrap();
+    super::production_scope::test_history(&c);
     let runtime = data_center::RuntimeReadiness {
         historical_dataset_count: 6,
         historical_cached_count: 3,
@@ -212,6 +213,7 @@ fn historical_unresolved_backlog_does_not_gate_resolved_current_match() {
     c.execute("INSERT INTO provider_team_mappings(team_id,provider,external_team_id,external_team_name) VALUES(1,'iddaa','home','Home'),(1,'football-data.co.uk','fd-home','Home'),(2,'iddaa','away','Away'),(2,'football-data.co.uk','fd-away','Away')", []).unwrap();
     c.execute("INSERT INTO provider_competition_metadata(provider,external_competition_id,external_name,resolution_status) VALUES('old-provider','old-league','Old League','unresolved')", []).unwrap();
     c.execute("INSERT INTO provider_competition_mappings(provider,external_competition_id,competition_id) VALUES('football-data.co.uk','TEST',1)",[]).unwrap();
+    super::production_scope::test_history(&c);
 
     let report =
         data_center::status(&c, &data_center::RuntimeReadiness::default(), now(4)).unwrap();
@@ -288,6 +290,7 @@ fn unresolved_events_outside_model_universe_are_nonblocking_and_optional_work_is
         c.execute("INSERT INTO matches(id,competition_id,season,home_team_id,away_team_id,kickoff_at,status,scheduled_local_date,kickoff_time_known) VALUES(?1,?2,'2026/27',1,2,?3,?4,?5,1)",rusqlite::params![id,competition,format!("{day}T15:0{id}:00Z"),status,day]).unwrap();
         c.execute("INSERT INTO provider_match_mappings(match_id,provider,external_match_id) VALUES(?1,'iddaa',?2)",rusqlite::params![id,id.to_string()]).unwrap();
     }
+    super::production_scope::test_history(&c);
     let a = data_center::status(&c, &Default::default(), now(4)).unwrap();
     assert_eq!(a.entity_resolution.metrics["unresolved_count"], 3);
     assert_eq!(a.entity_resolution.metrics["blocking_unresolved"], 0);
