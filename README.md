@@ -12,7 +12,6 @@ npm.cmd run tauri dev
 Gerçek bir lisans kaydı oluşturmadan yerel geliştirme arayüzünü açmak için yalnız debug Tauri çalıştırmasında geliştirme bypass'ı etkinleştirilebilir:
 
 ```powershell
-$env:ARZ_DEV_LICENSE_BYPASS="1"
 npm.cmd run tauri dev
 ```
 
